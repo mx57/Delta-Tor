@@ -3,7 +3,6 @@ package io.deltator.core.backend
 import android.content.Context
 import android.os.ParcelFileDescriptor
 import io.deltator.Config
-import io.deltator.core.dns.FakeDns
 import io.deltator.tunnel.HevSocks5Tunnel
 import io.deltator.tunnel.ParallelTorManager
 import io.deltator.tunnel.TorRunner
@@ -11,24 +10,15 @@ import io.deltator.tunnel.TorSocksBridge
 import io.deltator.util.AppLog as Log
 
 /**
- * Standard Tor Multipath Backend.
- * Runs ParallelTorManager (with PreFlightBridgePing & Mobile Conflux Profile),
- * TorSocksBridge (with FakeDNS enabled), and HevSocks5Tunnel (tun2socks).
+ * TunnelBackend implementation wrapping the Tor Racing core + HevSocks5Tunnel.
+ *
+ * Guarantees atomic rollback of [ParallelTorManager] and [TorSocksBridge] on partial
+ * startup failures or cancellation to prevent leaking child processes or TUN descriptors.
  */
 class TorTunnelBackend(
     private val context: Context,
-    private val sessionId: Int,
-    private val basePort: Int,
-    private val transportMode: String,
-    private val customBridges: String,
-    private val autoTransports: Set<String>,
-    private val runMemory: Boolean,
-    private val onProgress: (Map<String, TorRunner>) -> Unit
+    private val activeRunnerProvider: () -> TorRunner?
 ) : TunnelBackend {
-
-    companion object {
-        private const val TAG = "TorTunnelBackend"
-    }
 
     override val id: String = EngineMode.TOR_RACING.id
     override val displayName: String = EngineMode.TOR_RACING.title
@@ -36,82 +26,58 @@ class TorTunnelBackend(
     @Volatile
     private var running = false
 
-    @Volatile
-    var activeRunner: TorRunner? = null
-        private set
-
     override val isRunning: Boolean
-        get() = running && (activeRunner?.isRunning() == true)
+        get() = running
 
     override suspend fun start(tunFd: ParcelFileDescriptor): Boolean {
-        Log.i(TAG, "Starting TorTunnelBackend (sessionId=$sessionId, basePort=$basePort)")
+        return try {
+            val runner = activeRunnerProvider()
+            if (runner == null) {
+                Log.e(TAG, "Cannot start TorTunnelBackend: no active Tor runner bootstrapped")
+                rollback()
+                return false
+            }
 
-        // 1. Race Tor instances to select fastest bootstrap
-        val winner = ParallelTorManager.race(
-            context = context,
-            basePort = basePort,
-            sessionId = sessionId,
-            transportMode = transportMode,
-            customBridges = customBridges,
-            autoTransports = autoTransports,
-            runMemory = runMemory,
-            onProgress = onProgress
-        )
-        activeRunner = winner
+            val res = HevSocks5Tunnel.start(
+                tunFd = tunFd,
+                socksAddress = "127.0.0.1",
+                socksPort = Config.proxyPort,
+                enableUdpTunneling = true,
+                mtu = 1280
+            )
+            if (res.isFailure) {
+                Log.e(TAG, "HevSocks5Tunnel failed to start with Tor backend: ${res.exceptionOrNull()?.message}; rolling back")
+                rollback()
+                return false
+            }
 
-        // 2. Start TorSocksBridge with FakeDNS on proxyPort -> winner.torSocksPort
-        TorSocksBridge.upstreamMode = TorSocksBridge.UpstreamMode.TOR
-        TorSocksBridge.chainMode = when (Config.torChainMode) {
-            Config.TOR_CHAIN_WARP -> TorSocksBridge.ChainMode.WARP
-            Config.TOR_CHAIN_AMNEZIA -> TorSocksBridge.ChainMode.AMNEZIA
-            Config.TOR_CHAIN_MASQUE -> TorSocksBridge.ChainMode.MASQUE
-            Config.TOR_CHAIN_FREE_NODES -> TorSocksBridge.ChainMode.FREE_NODES
-            else -> TorSocksBridge.ChainMode.NONE
+            running = true
+            Log.i(TAG, "TorTunnelBackend successfully started on tunFd=${tunFd.fd}")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception starting TorTunnelBackend; executing fail-closed rollback", e)
+            rollback()
+            false
         }
-        val bridgeResult = TorSocksBridge.start(
-            torSocksPort = winner.torSocksPort,
-            torHost = "127.0.0.1",
-            listenPort = Config.proxyPort,
-            listenHost = "127.0.0.1"
-        )
-        if (bridgeResult.isFailure) {
-            Log.e(TAG, "Failed to start TorSocksBridge on 127.0.0.1:${Config.proxyPort}: ${bridgeResult.exceptionOrNull()?.message}")
-            return false
-        }
+    }
 
-        // 3. Start hev-socks5-tunnel (tun2socks) bound to tunFd
-        val tunResult = HevSocks5Tunnel.start(
-            tunFd = tunFd,
-            socksAddress = "127.0.0.1",
-            socksPort = Config.proxyPort,
-            enableUdpTunneling = true,
-            mtu = 1280,
-            ipv4Address = "10.255.255.1",
-            ipv6Address = "fd00::1",
-            disableQuic = true,
-            rejectNonDnsUdp = true
-        )
-        if (tunResult.isFailure) {
-            Log.e(TAG, "hev-socks5-tunnel start failed: ${tunResult.exceptionOrNull()?.message}")
-            return false
-        }
-
-        running = true
-        Log.i(TAG, "TorTunnelBackend successfully established on TUN fd ${tunFd.fd}")
-        return true
+    private fun rollback() {
+        try { HevSocks5Tunnel.stop() } catch (e: Exception) { Log.w(TAG, "Error stopping HevSocks5Tunnel", e) }
+        try { TorSocksBridge.stop() } catch (e: Exception) { Log.w(TAG, "Error stopping TorSocksBridge", e) }
+        try { ParallelTorManager.stopAll() } catch (e: Exception) { Log.w(TAG, "Error stopping ParallelTorManager", e) }
+        running = false
     }
 
     override fun stop() {
-        running = false
-        try { HevSocks5Tunnel.stop() } catch (_: Exception) {}
-        try { TorSocksBridge.stop() } catch (_: Exception) {}
-        try { ParallelTorManager.stopAll() } catch (_: Exception) {}
-        activeRunner = null
-        Log.i(TAG, "TorTunnelBackend stopped")
+        rollback()
     }
 
     override fun getStats(): BackendStats? {
         val s = HevSocks5Tunnel.getStats() ?: return null
-        return BackendStats(rxBytes = s.rxBytes, txBytes = s.txBytes)
+        return BackendStats(s.rxBytes, s.txBytes)
+    }
+
+    companion object {
+        private const val TAG = "TorTunnelBackend"
     }
 }

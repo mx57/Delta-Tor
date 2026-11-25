@@ -1,9 +1,12 @@
 package io.deltator
 
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import androidx.core.app.NotificationCompat
 import io.deltator.util.AppLog as Log
 
 /**
@@ -32,9 +35,24 @@ class InstallResultReceiver : BroadcastReceiver() {
                 val confirm = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
                 if (confirm != null) {
                     try {
-                        context.startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        val pi = PendingIntent.getActivity(
+                            context,
+                            44,
+                            confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                        )
+                        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                        val notif = NotificationCompat.Builder(context, TorVpnService.CHANNEL_UPDATES)
+                            .setSmallIcon(R.drawable.ic_tor)
+                            .setContentTitle("DeltaTor Update")
+                            .setContentText("Tap to confirm update installation.")
+                            .setContentIntent(pi)
+                            .setAutoCancel(true)
+                            .setPriority(NotificationCompat.PRIORITY_HIGH)
+                            .build()
+                        nm?.notify(44, notif)
                     } catch (e: Exception) {
-                        Log.w(TAG, "Could not launch install confirmation: ${e.message}")
+                        Log.w(TAG, "Could not launch install confirmation notification: ${e.message}")
                         AppState.updateRelease {
                             it.copy(lastError = "Could not open the installer: ${e.message}")
                         }

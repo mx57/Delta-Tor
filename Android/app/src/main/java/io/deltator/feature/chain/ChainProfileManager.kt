@@ -6,7 +6,12 @@ import io.deltator.Config
 import io.deltator.feature.amnezia.AmneziaConfig
 import io.deltator.feature.warp.WarpProfile
 import io.deltator.feature.warp.WarpRegistrar
+import io.deltator.TorVpnService
+import io.deltator.tunnel.BridgeCountries
+import io.deltator.tunnel.ExitNodes
 import io.deltator.tunnel.TorSocksBridge
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import io.deltator.util.AppLog as Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -38,7 +43,9 @@ data class ChainProfile(
     val rawConfig: String,
     val delayMs: Long = -1L,
     val isSelected: Boolean = false,
-    val details: String = ""
+    val details: String = "",
+    val countryCode: String = "",
+    val countryName: String = ""
 )
 
 object ChainProfileManager {
@@ -57,16 +64,33 @@ object ChainProfileManager {
     private val _testing = MutableStateFlow(false)
     val testing: StateFlow<Boolean> = _testing.asStateFlow()
 
+    private val _autoMatching = MutableStateFlow(false)
+    val autoMatching: StateFlow<Boolean> = _autoMatching.asStateFlow()
+
+    private val _lastAutoMatchSummary = MutableStateFlow<String?>(null)
+    val lastAutoMatchSummary: StateFlow<String?> = _lastAutoMatchSummary.asStateFlow()
+
+    data class AutoMatchResult(
+        val profile: ChainProfile,
+        val countryCode: String,
+        val countryName: String,
+        val pingMs: Long,
+        val summary: String
+    )
+
     private lateinit var prefs: android.content.SharedPreferences
+    private lateinit var appContext: Context
 
     private val DEFAULT_MASQUE_TEMPLATES = listOf(
         "https://cloudflare-dns.com:443" to "Cloudflare Anycast H3",
         "https://dns.google:443" to "Google Edge H3",
         "https://1.1.1.1:443" to "Cloudflare 1.1.1.1 H3",
-        "https://masque.example.com:443" to "Community MASQUE Gateway"
+        "https://quic.nginx.org:443" to "QUIC Nginx Test Edge",
+        "https://8.8.8.8:443" to "Google 8.8.8.8 H3"
     )
 
     fun init(context: Context) {
+        appContext = context.applicationContext
         prefs = context.getSharedPreferences("deltator_chain_profiles", Context.MODE_PRIVATE)
         loadProfiles()
         if (_warpProfiles.value.isEmpty()) seedDefaultWarpProfiles()
@@ -107,6 +131,8 @@ object ChainProfileManager {
                 o.put("delayMs", p.delayMs)
                 o.put("isSelected", p.isSelected)
                 o.put("details", p.details)
+                o.put("countryCode", p.countryCode)
+                o.put("countryName", p.countryName)
                 arr.put(o)
             }
             prefs.edit().putString(key, arr.toString()).apply()
@@ -129,7 +155,9 @@ object ChainProfileManager {
                     rawConfig = o.optString("rawConfig", ""),
                     delayMs = o.optLong("delayMs", -1L),
                     isSelected = o.optBoolean("isSelected", false),
-                    details = o.optString("details", "")
+                    details = o.optString("details", ""),
+                    countryCode = o.optString("countryCode", ""),
+                    countryName = o.optString("countryName", "")
                 )
             )
         }
@@ -163,7 +191,7 @@ object ChainProfileManager {
             ChainProfile(
                 type = ChainProfileType.AMNEZIA,
                 name = "AmneziaWG Profile #1 (Standard)",
-                endpoint = cur.endpoint.ifBlank { "185.190.140.1:51820" },
+                endpoint = cur.endpoint.ifBlank { "162.159.192.1:51820" },
                 rawConfig = cur.copy(jc = 4, s1 = 20, s2 = 30).toJson(),
                 isSelected = true,
                 details = "AWG 1.0 · Jc=4 · S1=20B · S2=30B"
@@ -171,7 +199,7 @@ object ChainProfileManager {
             ChainProfile(
                 type = ChainProfileType.AMNEZIA,
                 name = "AmneziaWG Profile #2 (Heavy Obfuscation)",
-                endpoint = "94.130.180.25:51820",
+                endpoint = "188.114.96.1:51820",
                 rawConfig = cur.copy(jc = 7, jmin = 45, jmax = 85, s1 = 32, s2 = 40).toJson(),
                 isSelected = false,
                 details = "AWG 2.0 · Jc=7 · S1=32B · S2=40B"
@@ -179,7 +207,7 @@ object ChainProfileManager {
             ChainProfile(
                 type = ChainProfileType.AMNEZIA,
                 name = "AmneziaWG Profile #3 (High Speed / Low Overhead)",
-                endpoint = "195.201.200.12:51820",
+                endpoint = "188.114.97.1:51820",
                 rawConfig = cur.copy(jc = 3, jmin = 20, jmax = 50, s1 = 15, s2 = 25).toJson(),
                 isSelected = false,
                 details = "AWG 3.1 · Jc=3 · S1=15B · S2=25B"
@@ -243,9 +271,10 @@ object ChainProfileManager {
                 details = "Account: ${prof.accountId.take(8)}... · Reserved: ${prof.reserved.size}B"
             )
 
-            // Measure ping
-            val delay = measurePing(candidateEp)
-            val withDelay = newProfile.copy(delayMs = delay)
+            // Measure ping + exit country
+            val delay = measurePing(candidateEp, ChainProfileType.WARP)
+            val (cc, cn) = resolveEndpointCountry(candidateEp)
+            val withDelay = newProfile.copy(delayMs = delay, countryCode = cc, countryName = cn)
 
             val updatedList = _warpProfiles.value + withDelay
             _warpProfiles.value = updatedList.sortedBy { if (it.delayMs < 0) Long.MAX_VALUE else it.delayMs }
@@ -261,30 +290,44 @@ object ChainProfileManager {
     /**
      * Generates a randomized AmneziaWG obfuscated config.
      */
-    suspend fun generateAmneziaProfile(): ChainProfile = withContext(Dispatchers.IO) {
-        val (priv, pub) = WarpRegistrar.generateKeyPair()
-        val (_, peerPub) = WarpRegistrar.generateKeyPair()
+    suspend fun generateAmneziaProfile(customEndpoint: String? = null, customConf: String? = null): ChainProfile = withContext(Dispatchers.IO) {
+        val parsed = customConf?.let { AmneziaConfig.fromJson(it) }
+        val (priv, pub) = if (parsed != null && parsed.privateKey.isNotBlank()) {
+            val privKey = parsed.privateKey
+            val pubKey = try {
+                val derived = WarpRegistrar.derivePublicKey(android.util.Base64.decode(privKey, android.util.Base64.DEFAULT))
+                android.util.Base64.encodeToString(derived, android.util.Base64.NO_WRAP)
+            } catch (_: Exception) { privKey }
+            privKey to pubKey
+        } else {
+            WarpRegistrar.generateKeyPair()
+        }
+        val peerPub = parsed?.peerPublicKey?.takeIf { it.isNotBlank() } ?: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 
-        val jc = (3..8).random()
-        val jmin = (25..45).random()
-        val jmax = (jmin + 20..jmin + 50).random()
-        val s1 = (15..35).random()
-        val s2 = (20..40).random()
-        val h1 = 0x10000000L + (0..0x0FFFFFFFL).random()
-        val h2 = 0x20000000L + (0..0x0FFFFFFFL).random()
-        val h3 = 0x30000000L + (0..0x0FFFFFFFL).random()
-        val h4 = 0x40000000L + (0..0x0FFFFFFFL).random()
+        val jc = parsed?.jc ?: (3..8).random()
+        val jmin = parsed?.jmin ?: (25..45).random()
+        val jmax = parsed?.jmax ?: (jmin + 20..jmin + 50).random()
+        val s1 = parsed?.s1 ?: (15..35).random()
+        val s2 = parsed?.s2 ?: (20..40).random()
+        val h1 = parsed?.h1 ?: (0x10000000L + (0..0x0FFFFFFFL).random())
+        val h2 = parsed?.h2 ?: (0x20000000L + (0..0x0FFFFFFFL).random())
+        val h3 = parsed?.h3 ?: (0x30000000L + (0..0x0FFFFFFFL).random())
+        val h4 = parsed?.h4 ?: (0x40000000L + (0..0x0FFFFFFFL).random())
 
         val sampleEndpoints = listOf(
-            "awg-de.deltator.net:51820",
-            "awg-nl.deltator.net:51820",
-            "awg-fi.deltator.net:51820",
-            "awg-us.deltator.net:51820",
-            "194.87.112.44:51820"
+            "162.159.192.1:51820",
+            "162.159.193.1:51820",
+            "162.159.195.1:51820",
+            "188.114.96.1:51820",
+            "188.114.97.1:51820",
+            "188.114.98.1:51820",
+            "188.114.99.1:51820",
+            "195.201.200.12:51820",
+            "94.130.180.25:51820"
         )
-        val ep = sampleEndpoints.random()
+        val ep = customEndpoint?.ifBlank { null } ?: parsed?.endpoint?.ifBlank { null } ?: sampleEndpoints.random()
 
-        val config = AmneziaConfig(
+        val config = (parsed ?: AmneziaConfig()).copy(
             privateKey = priv,
             peerPublicKey = peerPub,
             endpoint = ep,
@@ -300,17 +343,19 @@ object ChainProfileManager {
         )
 
         val count = _amneziaProfiles.value.size + 1
+        val name = if (customEndpoint != null || customConf != null) "AmneziaWG Custom #$count" else "AmneziaWG Generated #$count"
         val newProfile = ChainProfile(
             type = ChainProfileType.AMNEZIA,
-            name = "AmneziaWG Generated #$count",
+            name = name,
             endpoint = ep,
             rawConfig = config.toJson(),
             isSelected = false,
             details = "Jc=$jc · S1=${s1}B · S2=${s2}B · H1-H4 Magic"
         )
 
-        val delay = measurePing(ep)
-        val withDelay = newProfile.copy(delayMs = delay)
+        val delay = measurePing(ep, ChainProfileType.AMNEZIA)
+        val (cc, cn) = resolveEndpointCountry(ep)
+        val withDelay = newProfile.copy(delayMs = delay, countryCode = cc, countryName = cn)
 
         val updatedList = _amneziaProfiles.value + withDelay
         _amneziaProfiles.value = updatedList.sortedBy { if (it.delayMs < 0) Long.MAX_VALUE else it.delayMs }
@@ -326,7 +371,7 @@ object ChainProfileManager {
         val count = _masqueProfiles.value.size + 1
         val endpoint = customEndpoint?.ifBlank { null }
             ?: DEFAULT_MASQUE_TEMPLATES.getOrNull(count % DEFAULT_MASQUE_TEMPLATES.size)?.first
-            ?: "https://masque-node-${count}.example.com:443"
+            ?: "https://cloudflare-dns.com:443"
 
         val name = if (customEndpoint != null) "Custom MASQUE #$count" else "MASQUE H3 Node #$count"
         val token = customToken ?: UUID.randomUUID().toString().take(16)
@@ -340,8 +385,9 @@ object ChainProfileManager {
             details = "Token: ${token.take(6)}... · QUIC/HTTP/3 Datagrams"
         )
 
-        val delay = measurePing(endpoint)
-        val withDelay = newProfile.copy(delayMs = delay)
+        val delay = measurePing(endpoint, ChainProfileType.MASQUE)
+        val (cc, cn) = resolveEndpointCountry(endpoint)
+        val withDelay = newProfile.copy(delayMs = delay, countryCode = cc, countryName = cn)
 
         val updatedList = _masqueProfiles.value + withDelay
         _masqueProfiles.value = updatedList.sortedBy { if (it.delayMs < 0) Long.MAX_VALUE else it.delayMs }
@@ -412,13 +458,80 @@ object ChainProfileManager {
         }
     }
 
-    // ---------------------------------------------------------------- PING / PROBE
+    // ---------------------------------------------------------------- PING / PROBE & AUTO-MATCH
 
     /**
-     * Pings all profiles of a given type in parallel and sorts the list.
+     * Smart Auto-Match:
+     * 1. Rapidly tests all chain profiles in parallel.
+     * 2. Auto-selects the fastest responsive node (lowest latency).
+     * 3. Resolves its egress country.
+     * 4. Steers Tor's exit relay (ExitNodes {cc}) to match that exact country,
+     *    reducing inter-hop latency between Tor and the chain egress to minimum.
+     * 5. Live applies new circuit exit if Tor is active.
      */
-    suspend fun pingAll(type: ChainProfileType) = withContext(Dispatchers.IO) {
-        if (_testing.value) return@withContext
+    suspend fun autoMatchNearest(type: ChainProfileType): AutoMatchResult? = withContext(Dispatchers.IO) {
+        if (_autoMatching.value) return@withContext null
+        _autoMatching.value = true
+        try {
+            val updated = pingAll(type)
+            val candidates = updated.ifEmpty {
+                when (type) {
+                    ChainProfileType.WARP -> _warpProfiles.value
+                    ChainProfileType.AMNEZIA -> _amneziaProfiles.value
+                    ChainProfileType.MASQUE -> _masqueProfiles.value
+                }
+            }
+            if (candidates.isEmpty()) return@withContext null
+
+            // Pick fastest responsive node, or first candidate if all timed out
+            val best = candidates.filter { it.delayMs > 0 }.minByOrNull { it.delayMs }
+                ?: candidates.firstOrNull()
+                ?: return@withContext null
+
+            selectProfile(best)
+
+            var (cc, cn) = if (best.countryCode.isNotBlank()) {
+                best.countryCode to best.countryName
+            } else {
+                resolveEndpointCountry(best.endpoint)
+            }
+            if (cc.isBlank()) {
+                cc = "DE"
+                cn = "Germany"
+            }
+
+            // Adapt Tor exit node to match the chain's egress country
+            ExitNodes.replaceAll(listOf(cc), mapOf(cc to cn))
+
+            if (::appContext.isInitialized) {
+                try {
+                    val intent = android.content.Intent(appContext, TorVpnService::class.java).apply {
+                        action = TorVpnService.ACTION_APPLY_EXIT
+                    }
+                    appContext.startService(intent)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to apply live Tor exit: ${e.message}")
+                }
+            }
+
+            val summary = if (best.delayMs > 0) {
+                "${best.name} ($cn) ↔ Tor Exit [$cc] · ${best.delayMs} ms"
+            } else {
+                "${best.name} ($cn) ↔ Tor Exit [$cc]"
+            }
+            _lastAutoMatchSummary.value = summary
+            Log.i(TAG, "Smart Auto-Match: $summary")
+            AutoMatchResult(best, cc, cn, best.delayMs, summary)
+        } finally {
+            _autoMatching.value = false
+        }
+    }
+
+    /**
+     * Pings all profiles of a given type in parallel and sorts by delay.
+     */
+    suspend fun pingAll(type: ChainProfileType): List<ChainProfile> = withContext(Dispatchers.IO) {
+        if (_testing.value) return@withContext emptyList()
         _testing.value = true
         try {
             val list = when (type) {
@@ -426,11 +539,14 @@ object ChainProfileManager {
                 ChainProfileType.AMNEZIA -> _amneziaProfiles.value
                 ChainProfileType.MASQUE -> _masqueProfiles.value
             }
-            val semaphore = Semaphore(6)
-            val updated = list.map { prof ->
-                val delay = semaphore.withPermit { measurePing(prof.endpoint) }
-                prof.copy(delayMs = delay)
-            }.sortedBy { if (it.delayMs < 0) Long.MAX_VALUE else it.delayMs }
+            val deferreds = list.map { prof ->
+                async {
+                    val delay = measurePing(prof.endpoint, type)
+                    val (cc, cn) = resolveEndpointCountry(prof.endpoint)
+                    prof.copy(delayMs = delay, countryCode = cc, countryName = cn)
+                }
+            }
+            val updated = deferreds.awaitAll().sortedBy { if (it.delayMs < 0) Long.MAX_VALUE else it.delayMs }
 
             when (type) {
                 ChainProfileType.WARP -> {
@@ -446,20 +562,22 @@ object ChainProfileManager {
                     saveProfiles(ChainProfileType.MASQUE)
                 }
             }
+            updated.forEach { p -> Log.i(TAG, "ping $type: ${p.name} | ${p.endpoint} | ${p.delayMs}ms | ${p.countryCode} ${p.countryName}") }
 
-            // Auto-select fastest responsive node if current node is unreachable or unselected
             val currentSelected = updated.find { it.isSelected }
             if (currentSelected == null || currentSelected.delayMs < 0) {
                 selectBestProfile(type)
             }
+            updated
         } finally {
             _testing.value = false
         }
     }
 
     suspend fun pingSingle(profile: ChainProfile): Long = withContext(Dispatchers.IO) {
-        val delay = measurePing(profile.endpoint)
-        val update = { p: ChainProfile -> if (p.id == profile.id) p.copy(delayMs = delay) else p }
+        val delay = measurePing(profile.endpoint, profile.type)
+        val (cc, cn) = resolveEndpointCountry(profile.endpoint)
+        val update = { p: ChainProfile -> if (p.id == profile.id) p.copy(delayMs = delay, countryCode = cc, countryName = cn) else p }
         when (profile.type) {
             ChainProfileType.WARP -> {
                 _warpProfiles.value = _warpProfiles.value.map(update).sortedBy { if (it.delayMs < 0) Long.MAX_VALUE else it.delayMs }
@@ -477,74 +595,107 @@ object ChainProfileManager {
         delay
     }
 
-    private fun measurePing(endpoint: String): Long {
+    private suspend fun resolveEndpointCountry(endpoint: String): Pair<String, String> {
+        if (!::appContext.isInitialized) return "" to ""
+        return try {
+            var host = endpoint.trim()
+            if (host.startsWith("https://")) host = host.removePrefix("https://").substringBefore("/")
+            else if (host.startsWith("http://")) host = host.removePrefix("http://").substringBefore("/")
+            if (host.startsWith("[") && host.contains("]")) {
+                host = host.substringAfter("[").substringBefore("]")
+            } else if (host.count { it == ':' } == 1) {
+                host = host.substringBefore(":")
+            }
+            if (host.isBlank()) return "" to ""
+            val ip = try { java.net.InetAddress.getByName(host).hostAddress ?: host } catch (_: Exception) { host }
+            BridgeCountries.countryInfo(appContext, ip) ?: ("" to "")
+        } catch (_: Exception) { "" to "" }
+    }
+
+    fun measurePing(endpoint: String, type: ChainProfileType? = null): Long {
         var host = endpoint.trim()
-        var port = 443
+        var endpointPort = 443
 
         if (host.startsWith("https://")) {
             host = host.removePrefix("https://").substringBefore("/")
         } else if (host.startsWith("http://")) {
             host = host.removePrefix("http://").substringBefore("/")
         }
-        if (host.contains(":")) {
+        if (host.startsWith("[") && host.contains("]")) {
+            val after = host.substringAfter("]")
+            host = host.substringAfter("[").substringBefore("]")
+            if (after.startsWith(":")) {
+                endpointPort = after.removePrefix(":").toIntOrNull() ?: endpointPort
+            }
+        } else if (host.count { it == ':' } == 1) {
             val parts = host.split(":")
             host = parts[0]
-            port = parts[1].toIntOrNull() ?: 443
+            endpointPort = parts[1].toIntOrNull() ?: endpointPort
+        }
+        if (host.isBlank()) return -1L
+
+        // Resolve hostname to IP, preferring IPv4
+        val targetIp = try {
+            val addrs = java.net.InetAddress.getAllByName(host)
+            addrs.firstOrNull { it is java.net.Inet4Address }?.hostAddress
+                ?: addrs.firstOrNull()?.hostAddress
+                ?: host
+        } catch (_: Exception) {
+            host
         }
 
-        // If Tor bridge is running, measure through Tor SOCKS5 to get true double-hop RTT
-        if (TorSocksBridge.isRunning()) {
+        // 1. High-speed system ICMP ping (works on Android without root for responsive nodes)
+        if (targetIp.matches(Regex("^(?:\\d{1,3}\\.){3}\\d{1,3}$"))) {
             try {
-                val start = SystemClock.elapsedRealtime()
-                val s = Socket()
-                s.connect(InetSocketAddress("127.0.0.1", Config.proxyPort), 3000)
-                s.soTimeout = 4000
-                val out = s.getOutputStream()
-                val inp = s.getInputStream()
-
-                // SOCKS5 handshake
-                out.write(byteArrayOf(0x05, 0x01, 0x00))
-                out.flush()
-                val dis = java.io.DataInputStream(inp)
-                val gr = ByteArray(2)
-                dis.readFully(gr)
-                if (gr[0] != 0x05.toByte() || gr[1] != 0x00.toByte()) {
-                    s.close()
-                    return -1L
+                val proc = Runtime.getRuntime().exec(arrayOf("/system/bin/ping", "-c", "1", "-w", "1", targetIp))
+                val reader = proc.inputStream.bufferedReader()
+                var line: String?
+                var pingMs = -1L
+                while (reader.readLine().also { line = it } != null) {
+                    val l = line ?: break
+                    if ("time=" in l) {
+                        val part = l.substringAfter("time=").substringBefore(" ")
+                        val ms = part.toDoubleOrNull()?.toLong() ?: -1L
+                        if (ms >= 0) {
+                            pingMs = ms.coerceAtLeast(1L)
+                            break
+                        }
+                    }
                 }
-
-                // SOCKS5 CONNECT
-                val hb = host.toByteArray(Charsets.US_ASCII)
-                out.write(byteArrayOf(0x05, 0x01, 0x00, 0x03, hb.size.toByte()) + hb + byteArrayOf((port shr 8).toByte(), (port and 0xFF).toByte()))
-                out.flush()
-                val respHeader = ByteArray(4)
-                dis.readFully(respHeader)
-                val rtt = SystemClock.elapsedRealtime() - start
-                s.close()
-                if (respHeader[0] == 0x05.toByte() && respHeader[1] == 0x00.toByte()) {
-                    return rtt
-                }
+                proc.waitFor()
+                if (pingMs > 0) return pingMs
             } catch (_: Exception) {}
         }
 
-        // Direct TCP connect fallback
-        return try {
+        // 2. TCP Handshake probe (works for MASQUE, Amnezia, and proxies with open TCP ports)
+        val probePorts = when (type) {
+            ChainProfileType.WARP -> listOf(endpointPort, 443, 80)
+            ChainProfileType.AMNEZIA -> listOf(endpointPort, 443, 80, 22)
+            ChainProfileType.MASQUE -> listOf(endpointPort, 443, 80)
+            else -> listOf(endpointPort, 443, 80)
+        }.distinct()
+
+        for (port in probePorts) {
             val start = SystemClock.elapsedRealtime()
-            val socket = Socket()
-            socket.connect(InetSocketAddress(host, port), 2500)
-            val rtt = SystemClock.elapsedRealtime() - start
-            socket.close()
-            rtt
-        } catch (_: Exception) {
+            var socket: Socket? = null
             try {
-                val start = SystemClock.elapsedRealtime()
-                val addr = java.net.InetAddress.getByName(host)
-                if (addr.isReachable(2000)) {
-                    SystemClock.elapsedRealtime() - start
-                } else -1L
+                socket = Socket()
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(host, port), 800)
+                val rtt = SystemClock.elapsedRealtime() - start
+                return rtt.coerceAtLeast(1L)
+            } catch (ce: java.net.ConnectException) {
+                // Connection refused = remote host answered with TCP RST! It is alive!
+                val rtt = SystemClock.elapsedRealtime() - start
+                if (rtt < 750) {
+                    return rtt.coerceAtLeast(1L)
+                }
             } catch (_: Exception) {
-                -1L
+            } finally {
+                try { socket?.close() } catch (_: Exception) {}
             }
         }
+
+        return -1L
     }
 }

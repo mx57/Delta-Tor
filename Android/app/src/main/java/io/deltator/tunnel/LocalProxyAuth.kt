@@ -3,6 +3,8 @@ package io.deltator.tunnel
 import io.deltator.util.AppLog as Log
 import java.io.InputStream
 import java.io.OutputStream
+import java.security.MessageDigest
+import java.security.SecureRandom
 
 /**
  * Shared SOCKS5 local proxy authentication handler.
@@ -11,11 +13,25 @@ import java.io.OutputStream
  * listener side. When auth is enabled, clients must provide valid credentials
  * before the proxy will accept CONNECT or FWD_UDP requests.
  *
- * This prevents other apps on the device from abusing the local proxy to
- * bypass VPNService routing, split tunneling, and per-app rules.
+ * Uses constant-time MessageDigest.isEqual comparison to resist timing attacks.
+ * Disallows silent fallback to NO AUTH (0x05, 0x00) unless explicitly allowed (allowNoAuth = true).
  */
 object LocalProxyAuth {
     private const val TAG = "LocalProxyAuth"
+
+    /**
+     * Generates random one-time session credentials via CSPRNG.
+     */
+    fun generateSessionCredentials(): Pair<String, String> {
+        val random = SecureRandom()
+        val userBytes = ByteArray(16)
+        val passBytes = ByteArray(16)
+        random.nextBytes(userBytes)
+        random.nextBytes(passBytes)
+        val user = userBytes.joinToString("") { "%02x".format(it) }
+        val pass = passBytes.joinToString("") { "%02x".format(it) }
+        return user to pass
+    }
 
     /**
      * Handle SOCKS5 greeting authentication after VER, NMETHODS, and METHODS
@@ -24,30 +40,35 @@ object LocalProxyAuth {
      * @param methods The authentication methods offered by the client
      * @param input Client input stream
      * @param output Client output stream
-     * @param username Required username (null/empty = no auth required)
-     * @param password Required password (null/empty = no auth required)
-     * @return true if authentication succeeded (or was not required), false if rejected
+     * @param username Required username
+     * @param password Required password
+     * @param allowNoAuth Whether unauthenticated NO AUTH (0x05, 0x00) is permitted
+     * @return true if authentication succeeded (or was explicitly allowed without auth), false if rejected
      */
     fun handleGreeting(
         methods: ByteArray,
         input: InputStream,
         output: OutputStream,
         username: String?,
-        password: String?
+        password: String?,
+        allowNoAuth: Boolean = false
     ): Boolean {
-        val authRequired = !username.isNullOrEmpty() && !password.isNullOrEmpty()
+        val hasCredentials = !username.isNullOrEmpty() && !password.isNullOrEmpty()
 
-        if (!authRequired) {
-            // No authentication required
-            output.write(byteArrayOf(0x05, 0x00))
+        if (!hasCredentials) {
+            if (allowNoAuth && methods.contains(0x00.toByte())) {
+                output.write(byteArrayOf(0x05, 0x00))
+                output.flush()
+                return true
+            }
+            Log.w(TAG, "Rejecting client: credentials required but not configured (NO AUTH disabled)")
+            output.write(byteArrayOf(0x05, 0xFF.toByte()))
             output.flush()
-            return true
+            return false
         }
 
         // Check if client supports USERNAME/PASSWORD (0x02)
         if (!methods.contains(0x02.toByte())) {
-            // Client doesn't support USERNAME/PASSWORD — reject with 0xFF (no acceptable methods).
-            // Expected for readiness probes and apps that only offer NO_AUTH.
             Log.d(TAG, "Client does not support USERNAME/PASSWORD auth, rejecting")
             output.write(byteArrayOf(0x05, 0xFF.toByte()))
             output.flush()
@@ -71,22 +92,24 @@ object LocalProxyAuth {
         if (uLen < 0) return false
         val uBytes = ByteArray(uLen)
         readExactly(input, uBytes)
-        val clientUser = String(uBytes, Charsets.UTF_8)
 
         val pLen = input.read()
         if (pLen < 0) return false
         val pBytes = ByteArray(pLen)
         readExactly(input, pBytes)
-        val clientPass = String(pBytes, Charsets.UTF_8)
 
-        return if (clientUser == username && clientPass == password) {
-            // Auth success
+        val expectedUser = username.toByteArray(Charsets.UTF_8)
+        val expectedPass = password.toByteArray(Charsets.UTF_8)
+
+        val userMatch = MessageDigest.isEqual(uBytes, expectedUser)
+        val passMatch = MessageDigest.isEqual(pBytes, expectedPass)
+
+        return if (userMatch && passMatch) {
             output.write(byteArrayOf(0x01, 0x00))
             output.flush()
             true
         } else {
-            // Auth failure
-            Log.w(TAG, "Authentication failed for user: $clientUser")
+            Log.w(TAG, "Authentication failed for local proxy client")
             output.write(byteArrayOf(0x01, 0x01))
             output.flush()
             false

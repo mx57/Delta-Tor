@@ -19,6 +19,7 @@ internal static class Program
         // also syncs AppLog.Enabled = Config.LoggingEnabled, which Android does
         // on the line right after Config.init.
         Config.Init();
+        SystemProxy.RestoreIfCrashed();
         ExitNodes.Init();
         // Android ExitNodes.loadDirectory (MainActivity 157): the capacity
         // table and the picker list both arrive in the background.
@@ -28,7 +29,7 @@ internal static class Program
         // Windows equivalent; the tray/toast surface initializes with the UI.
         BridgeStore.RefreshState();
         Task.Run(BridgeStore.AutoUpdateIfStale);
-        Task.Run(ReleaseChecker.Check);
+        Task.Run(() => ReleaseChecker.CheckAsync());
         Task.Run(InstallCounter.CountInstall);
         MaybeShowFirstRunNotice();
 

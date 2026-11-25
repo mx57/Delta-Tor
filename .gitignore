@@ -49,3 +49,4 @@ runs.json
 /Windows/libs/se7entun/
 /Se7enTun-*.zip
 /releases/
+.agents/

@@ -78,6 +78,7 @@ android {
         targetSdk = 35
         versionCode = appVersionCode
         versionName = appVersion
+        buildConfigField("String", "RELEASE_REPO", "\"mx57/Delta-Tor\"")
     }
 
     signingConfigs {
@@ -137,6 +138,12 @@ android {
         }
     }
 
+    testOptions {
+        unitTests {
+            isReturnDefaultValues = true
+        }
+    }
+
     // Build hev-socks5-tunnel (tun2socks) with ndk-build
     externalNativeBuild {
         ndkBuild {
@@ -154,6 +161,9 @@ kotlin {
 dependencies {
     // Snowflake pluggable transport (Go gomobile bindings)
     implementation(files("libs/golibs-full.aar"))
+    if (file("libs/deltator-netcore.aar").exists()) {
+        implementation(files("libs/deltator-netcore.aar"))
+    }
 
     // Compose BOM
     val composeBom = platform("androidx.compose:compose-bom:2026.01.01")
@@ -184,4 +194,13 @@ dependencies {
 
     // Core
     implementation("androidx.core:core-ktx:1.17.0")
+
+    // WireGuard/AWG userspace backend (supports AWG params; also used for WARP/WG).
+    implementation("com.zaneschepke:amneziawg-android:1.3.0")
+
+    // Cryptography: standard constant-time X25519 Curve25519
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
+    // Unit testing
+    testImplementation("junit:junit:4.13.2")
 }

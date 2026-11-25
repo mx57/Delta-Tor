@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using DeltaTor.Core.Util;
 using Microsoft.Win32;
 
@@ -21,8 +22,24 @@ public static class SystemProxy
 
     private static readonly object Lock = new();
     private static bool _applied;
-    private static bool _prevEnabled;
-    private static string _prevServer = "";
+    private static ProxyBackup? _prevBackup;
+
+    private sealed record ProxyBackup(
+        bool ProxyEnable,
+        string ProxyServer,
+        string? ProxyOverride,
+        string? AutoConfigURL
+    );
+
+    private static string BackupFilePath
+    {
+        get
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeltaTor");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "system-proxy-backup.json");
+        }
+    }
 
     [DllImport("wininet.dll", SetLastError = true)]
     private static extern bool InternetSetOption(
@@ -34,6 +51,26 @@ public static class SystemProxy
         get { lock (Lock) return _applied; }
     }
 
+    /// <summary>Restores pre-crash system proxy settings if backup file exists from abnormal termination.</summary>
+    public static void RestoreIfCrashed()
+    {
+        lock (Lock)
+        {
+            try
+            {
+                if (File.Exists(BackupFilePath))
+                {
+                    AppLog.I("SystemProxy", "Lingering system-proxy-backup.json detected from previous crash; restoring...");
+                    Clear();
+                }
+            }
+            catch (Exception e)
+            {
+                AppLog.W("SystemProxy", $"Error during crash proxy restore check: {e.Message}");
+            }
+        }
+    }
+
     /// <summary>Enable the machine proxy at host:port (HTTP-proxy form).
     /// <paramref name="port"/> is the winner's Tor HTTPTunnelPort. No-op-safe
     /// on failure.</summary>
@@ -41,6 +78,12 @@ public static class SystemProxy
     {
         lock (Lock)
         {
+            if (string.IsNullOrWhiteSpace(host) || port <= 0 || port > 65535)
+            {
+                AppLog.W("SystemProxy", $"Invalid host or port: {host}:{port}; system proxy not set");
+                return;
+            }
+
             try
             {
                 using var key = Registry.CurrentUser.OpenSubKey(KeyPath, writable: true);
@@ -49,20 +92,39 @@ public static class SystemProxy
                     AppLog.W("SystemProxy", "Internet Settings key missing; system proxy not set");
                     return;
                 }
+
                 if (!_applied)
                 {
-                    _prevEnabled = key.GetValue("ProxyEnable") is int pe && pe != 0;
-                    _prevServer = key.GetValue("ProxyServer") as string ?? "";
+                    var currentEnable = key.GetValue("ProxyEnable") is int pe && pe != 0;
+                    var currentServer = key.GetValue("ProxyServer") as string ?? "";
+                    var currentOverride = key.GetValue("ProxyOverride") as string;
+                    var currentAutoConfig = key.GetValue("AutoConfigURL") as string;
+
+                    var backup = new ProxyBackup(currentEnable, currentServer, currentOverride, currentAutoConfig);
+                    _prevBackup = backup;
+
+                    // Persist backup to disk before touching registry
+                    try
+                    {
+                        var json = JsonSerializer.Serialize(backup, new JsonSerializerOptions { WriteIndented = true });
+                        File.WriteAllText(BackupFilePath, json);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLog.W("SystemProxy", $"Failed to save proxy backup file: {ex.Message}");
+                    }
                 }
-                // Bare host:port — the HTTP-proxy form the Windows settings
-                // page expects: Address 127.0.0.1, Port 9071. No scheme, no
-                // "socks=" prefix (which Windows shows as garbage and many
-                // apps turn into "http://socks=…"). The port is Tor's own
-                // HTTPTunnelPort, which speaks HTTP CONNECT — no custom bridge.
+
                 var target = $"{host}:{port}";
                 key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
                 key.SetValue("ProxyServer", target, RegistryValueKind.String);
-                NotifyWinInet();
+                key.Flush();
+
+                if (!NotifyWinInet())
+                {
+                    AppLog.W("SystemProxy", "InternetSetOption failed to broadcast settings change");
+                }
+
                 _applied = true;
                 AppLog.I("SystemProxy", $"System proxy set to {target} (Tor HTTPTunnelPort)");
             }
@@ -78,33 +140,70 @@ public static class SystemProxy
     {
         lock (Lock)
         {
-            if (!_applied) return;
+            if (!_applied && !File.Exists(BackupFilePath)) return;
+
             try
             {
-                using var key = Registry.CurrentUser.OpenSubKey(KeyPath, writable: true);
-                if (key != null)
+                var backup = _prevBackup;
+                if (backup == null && File.Exists(BackupFilePath))
                 {
-                    key.SetValue("ProxyEnable", _prevEnabled ? 1 : 0, RegistryValueKind.DWord);
-                    key.SetValue("ProxyServer", _prevServer, RegistryValueKind.String);
+                    try
+                    {
+                        var text = File.ReadAllText(BackupFilePath);
+                        backup = JsonSerializer.Deserialize<ProxyBackup>(text);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLog.W("SystemProxy", $"Failed to read proxy backup file: {ex.Message}");
+                    }
                 }
-                NotifyWinInet();
+
+                using var key = Registry.CurrentUser.OpenSubKey(KeyPath, writable: true);
+                if (key != null && backup != null)
+                {
+                    key.SetValue("ProxyEnable", backup.ProxyEnable ? 1 : 0, RegistryValueKind.DWord);
+                    key.SetValue("ProxyServer", backup.ProxyServer, RegistryValueKind.String);
+                    if (!string.IsNullOrEmpty(backup.ProxyOverride))
+                        key.SetValue("ProxyOverride", backup.ProxyOverride, RegistryValueKind.String);
+                    else
+                        key.DeleteValue("ProxyOverride", false);
+
+                    if (!string.IsNullOrEmpty(backup.AutoConfigURL))
+                        key.SetValue("AutoConfigURL", backup.AutoConfigURL, RegistryValueKind.String);
+                    else
+                        key.DeleteValue("AutoConfigURL", false);
+
+                    key.Flush();
+                }
+
+                if (!NotifyWinInet())
+                {
+                    AppLog.W("SystemProxy", "InternetSetOption failed to broadcast restore change");
+                }
+
+                // Delete backup file only after registry write succeeds
+                try
+                {
+                    if (File.Exists(BackupFilePath)) File.Delete(BackupFilePath);
+                }
+                catch { /* ignored */ }
+
+                _applied = false;
+                _prevBackup = null;
                 AppLog.I("SystemProxy", "System proxy restored to the previous value");
             }
             catch (Exception e)
             {
                 AppLog.W("SystemProxy", $"Failed to restore system proxy: {e.Message}");
             }
-            finally
-            {
-                _applied = false;
-            }
         }
     }
 
     /// <summary>Broadcast the registry change to running apps (WinINET).</summary>
-    private static void NotifyWinInet()
+    private static bool NotifyWinInet()
     {
-        InternetSetOption(IntPtr.Zero, InternetOptionSettingsChanged, IntPtr.Zero, 0);
-        InternetSetOption(IntPtr.Zero, InternetOptionRefresh, IntPtr.Zero, 0);
+        var r1 = InternetSetOption(IntPtr.Zero, InternetOptionSettingsChanged, IntPtr.Zero, 0);
+        var r2 = InternetSetOption(IntPtr.Zero, InternetOptionRefresh, IntPtr.Zero, 0);
+        return r1 && r2;
     }
 }

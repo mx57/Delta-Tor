@@ -1,4 +1,4 @@
-Microsoft Visual Studio Solution File, Format Version 12.00
+﻿Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
@@ -7,6 +7,10 @@ EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DeltaTor.App", "src\DeltaTor.App\DeltaTor.App.csproj", "{2B7E4D1E-0C3F-4A6B-9D8E-3F5C7B0A1242}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "DeltaTor.Native", "src\DeltaTor.Native\DeltaTor.Native.csproj", "{3C8F5E2F-1D40-4B7C-AE9F-4A6D8C1B2353}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{9C719C2E-8E8B-4DC2-BB73-D4A7B0744F62}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DeltaTor.Core.Tests", "tests\DeltaTor.Core.Tests\DeltaTor.Core.Tests.csproj", "{09D94594-1490-4EFD-945E-B1B356129C8B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -26,8 +30,15 @@ Global
 		{3C8F5E2F-1D40-4B7C-AE9F-4A6D8C1B2353}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{3C8F5E2F-1D40-4B7C-AE9F-4A6D8C1B2353}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{3C8F5E2F-1D40-4B7C-AE9F-4A6D8C1B2353}.Release|Any CPU.Build.0 = Release|Any CPU
+		{09D94594-1490-4EFD-945E-B1B356129C8B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{09D94594-1490-4EFD-945E-B1B356129C8B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{09D94594-1490-4EFD-945E-B1B356129C8B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{09D94594-1490-4EFD-945E-B1B356129C8B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{09D94594-1490-4EFD-945E-B1B356129C8B} = {9C719C2E-8E8B-4DC2-BB73-D4A7B0744F62}
 	EndGlobalSection
 EndGlobal

@@ -74,6 +74,13 @@ data class AmneziaConfig(
         appendLine("AllowedIPs = $allowedIps")
     }
 
+    fun validate(): Boolean {
+        if (privateKey.isBlank() || peerPublicKey.isBlank() || endpoint.isBlank()) return false
+        val parts = endpoint.split(":")
+        if (parts.size != 2 || parts[1].toIntOrNull() == null) return false
+        return true
+    }
+
     companion object {
         fun fromJson(jsonStr: String): AmneziaConfig? = try {
             val obj = JSONObject(jsonStr)
@@ -99,6 +106,35 @@ data class AmneziaConfig(
             null
         }
 
+        private fun stripComments(str: String): String {
+            var inQuotes = false
+            val sb = StringBuilder()
+            for (ch in str) {
+                if (ch == '"') {
+                    inQuotes = !inQuotes
+                    sb.append(ch)
+                } else if (!inQuotes && (ch == '#' || ch == ';')) {
+                    break
+                } else {
+                    sb.append(ch)
+                }
+            }
+            return sb.toString().trim()
+        }
+
+        private fun parseLongOrHex(v: String, default: Long): Long {
+            val clean = v.trim()
+            return try {
+                if (clean.startsWith("0x", ignoreCase = true)) {
+                    clean.substring(2).toLong(16)
+                } else {
+                    clean.toLong()
+                }
+            } catch (_: Exception) {
+                default
+            }
+        }
+
         fun parseConf(confText: String): AmneziaConfig {
             var privKey = ""
             var addr = "10.8.0.2/24"
@@ -118,9 +154,9 @@ data class AmneziaConfig(
             var h4 = 0x456789ABL
 
             confText.lines().forEach { rawLine ->
-                val line = rawLine.trim()
-                if (line.isEmpty() || line.startsWith("#")) return@forEach
-                val parts = line.split("=", limit = 2).map { it.trim() }
+                val lineWithoutComment = stripComments(rawLine)
+                if (lineWithoutComment.isEmpty()) return@forEach
+                val parts = lineWithoutComment.split("=", limit = 2).map { it.trim() }
                 if (parts.size == 2) {
                     val k = parts[0].lowercase()
                     val v = parts[1]
@@ -137,10 +173,10 @@ data class AmneziaConfig(
                         "jmax" -> jmax = v.toIntOrNull() ?: jmax
                         "s1" -> s1 = v.toIntOrNull() ?: s1
                         "s2" -> s2 = v.toIntOrNull() ?: s2
-                        "h1" -> h1 = v.toLongOrNull() ?: h1
-                        "h2" -> h2 = v.toLongOrNull() ?: h2
-                        "h3" -> h3 = v.toLongOrNull() ?: h3
-                        "h4" -> h4 = v.toLongOrNull() ?: h4
+                        "h1" -> h1 = parseLongOrHex(v, h1)
+                        "h2" -> h2 = parseLongOrHex(v, h2)
+                        "h3" -> h3 = parseLongOrHex(v, h3)
+                        "h4" -> h4 = parseLongOrHex(v, h4)
                     }
                 }
             }

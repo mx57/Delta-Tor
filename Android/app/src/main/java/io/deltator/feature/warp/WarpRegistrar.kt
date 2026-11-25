@@ -1,6 +1,6 @@
 package io.deltator.feature.warp
 
-import android.util.Base64
+import org.bouncycastle.util.encoders.Base64
 import io.deltator.util.AppLog as Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -8,7 +8,6 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.math.BigInteger
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.SecureRandom
@@ -39,7 +38,7 @@ data class WarpProfile(
         obj.put("addressV6", addressV6)
         obj.put("peerPublicKey", peerPublicKey)
         obj.put("endpoint", endpoint)
-        obj.put("reserved", Base64.encodeToString(reserved, Base64.NO_WRAP))
+        obj.put("reserved", Base64.toBase64String(reserved))
         obj.put("accountId", accountId)
         obj.put("token", token)
         return obj.toString()
@@ -48,7 +47,7 @@ data class WarpProfile(
     companion object {
         fun fromJson(jsonStr: String): WarpProfile? = try {
             val obj = JSONObject(jsonStr)
-            val reservedBytes = Base64.decode(obj.optString("reserved", ""), Base64.DEFAULT)
+            val reservedBytes = Base64.decode(obj.optString("reserved", ""))
             WarpProfile(
                 privateKey = obj.getString("privateKey"),
                 publicKey = obj.getString("publicKey"),
@@ -80,6 +79,7 @@ object WarpRegistrar {
 
     // Official Cloudflare Anycast IP pool for DPI bypass rotation
     val ANYCAST_ENDPOINTS = listOf(
+        "engage.cloudflareclient.com:2408",
         "162.159.192.1:2408",
         "162.159.193.1:2408",
         "162.159.195.1:2408",
@@ -94,80 +94,37 @@ object WarpRegistrar {
     )
 
     /**
-     * Self-contained Montgomery Curve25519 scalar multiplication:
-     * Derives public key (32 bytes) from private key (32 bytes).
+     * Clamps a 32-byte private key per RFC 7748.
      */
-    fun derivePublicKey(privateKey: ByteArray): ByteArray {
-        val p = BigInteger.valueOf(2).pow(255).subtract(BigInteger.valueOf(19))
-        val a24 = BigInteger.valueOf(121665)
-
+    fun clampPrivateKey(privateKey: ByteArray): ByteArray {
         val clamped = privateKey.copyOf(32)
         clamped[0] = (clamped[0].toInt() and 248).toByte()
         clamped[31] = (clamped[31].toInt() and 127).toByte()
         clamped[31] = (clamped[31].toInt() or 64).toByte()
-
-        var k = BigInteger.ZERO
-        for (i in 0 until 32) {
-            k = k.add(BigInteger.valueOf(clamped[i].toLong() and 0xFF).shiftLeft(i * 8))
-        }
-
-        var x1 = BigInteger.valueOf(9)
-        var x2 = BigInteger.ONE
-        var z2 = BigInteger.ZERO
-        var x3 = x1
-        var z3 = BigInteger.ONE
-
-        var swap = 0
-        for (t in 254 downTo 0) {
-            val kt = (k.shiftRight(t).and(BigInteger.ONE)).toInt()
-            swap = swap xor kt
-            if (swap != 0) {
-                var tmp = x2; x2 = x3; x3 = tmp
-                tmp = z2; z2 = z3; z3 = tmp
-            }
-            swap = kt
-
-            val a = x2.add(z2).mod(p)
-            val aa = a.multiply(a).mod(p)
-            val b = x2.subtract(z2).mod(p)
-            val bb = b.multiply(b).mod(p)
-            val e = aa.subtract(bb).mod(p)
-            val c = x3.add(z3).mod(p)
-            val d = x3.subtract(z3).mod(p)
-            val da = d.multiply(a).mod(p)
-            val cb = c.multiply(b).mod(p)
-
-            x3 = da.add(cb).mod(p).pow(2).mod(p)
-            z3 = x1.multiply(da.subtract(cb).mod(p).pow(2)).mod(p)
-            x2 = aa.multiply(bb).mod(p)
-            z2 = e.multiply(aa.add(a24.multiply(e))).mod(p)
-        }
-
-        if (swap != 0) {
-            var tmp = x2; x2 = x3; x3 = tmp
-            tmp = z2; z2 = z3; z3 = tmp
-        }
-
-        val result = x2.multiply(z2.modInverse(p)).mod(p)
-        val pubBytes = ByteArray(32)
-        var rem = result
-        for (i in 0 until 32) {
-            pubBytes[i] = rem.and(BigInteger.valueOf(0xFF)).toByte()
-            rem = rem.shiftRight(8)
-        }
-        return pubBytes
+        return clamped
     }
 
     /**
-     * Generate a new Curve25519 keypair.
+     * Standard constant-time Montgomery Curve25519 scalar multiplication (RFC 7748):
+     * Derives public key (32 bytes) from private key (32 bytes).
+     */
+    fun derivePublicKey(privateKey: ByteArray): ByteArray {
+        val clamped = clampPrivateKey(privateKey)
+        val privParams = org.bouncycastle.crypto.params.X25519PrivateKeyParameters(clamped, 0)
+        return privParams.generatePublicKey().encoded
+    }
+
+    /**
+     * Generate a new Curve25519 keypair with proper RFC 7748 clamping prior to Base64 encoding.
      * Returns Pair(privateKeyBase64, publicKeyBase64).
      */
     fun generateKeyPair(): Pair<String, String> {
         val random = SecureRandom()
-        val priv = ByteArray(32)
-        random.nextBytes(priv)
-        val pub = derivePublicKey(priv)
-        return Base64.encodeToString(priv, Base64.NO_WRAP) to Base64.encodeToString(pub, Base64.NO_WRAP)
+        val rawPriv = ByteArray(32)
+        random.nextBytes(rawPriv)
+        val clampedPriv = clampPrivateKey(rawPriv)
+        val pub = derivePublicKey(clampedPriv)
+        return Base64.toBase64String(clampedPriv) to Base64.toBase64String(pub)
     }
 
     /**
@@ -197,64 +154,69 @@ object WarpRegistrar {
             } else {
                 java.net.Proxy.NO_PROXY
             }
-            val conn = url.openConnection(proxy) as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.connectTimeout = 4000
-            conn.readTimeout = 4000
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-            conn.setRequestProperty("User-Agent", "okhttp/3.12.1")
+            var conn: HttpURLConnection? = null
+            try {
+                conn = url.openConnection(proxy) as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                conn.setRequestProperty("User-Agent", "okhttp/3.12.1")
 
-            conn.outputStream.use { os ->
-                OutputStreamWriter(os, Charsets.UTF_8).use { it.write(payload.toString()) }
+                conn.outputStream.use { os ->
+                    OutputStreamWriter(os, Charsets.UTF_8).use { it.write(payload.toString()) }
+                }
+
+                val code = conn.responseCode
+                if (code !in 200..204) {
+                    val err = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $code"
+                    Log.e(TAG, "WARP registration failed: $code $err")
+                    return@withContext Result.failure(RuntimeException("WARP registration error: $code $err"))
+                }
+
+                val body = conn.inputStream.bufferedReader().readText()
+                val json = JSONObject(body)
+
+                val id = json.optString("id", "")
+                val token = json.optString("token", "")
+                val config = json.getJSONObject("config")
+                val iface = config.getJSONObject("interface")
+                val addrs = iface.getJSONObject("addresses")
+                val v4 = addrs.optString("v4", "172.16.0.2/32")
+                val v6 = addrs.optString("v6", "")
+
+                val peers = config.getJSONArray("peers")
+                val peer0 = peers.getJSONObject(0)
+                val peerPubKey = peer0.optString("public_key", "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=")
+                val endpointObj = peer0.optJSONObject("endpoint")
+                val endpointHost = endpointObj?.optString("host", "162.159.192.1:2408") ?: "162.159.192.1:2408"
+
+                // Extract reserved bytes: client_id in Cloudflare API is 3 bytes (encoded in base64 or hex)
+                val clientIdRaw = config.optString("client_id", "")
+                val reservedBytes = if (clientIdRaw.isNotEmpty()) {
+                    try { Base64.decode(clientIdRaw) } catch (_: Exception) { ByteArray(3) }
+                } else {
+                    ByteArray(3)
+                }
+
+                val profile = WarpProfile(
+                    privateKey = privKey,
+                    publicKey = pubKey,
+                    addressV4 = v4,
+                    addressV6 = v6,
+                    peerPublicKey = peerPubKey,
+                    endpoint = endpointHost,
+                    reserved = reservedBytes,
+                    accountId = id,
+                    token = token
+                )
+
+                Log.i(TAG, "WARP profile successfully registered! Address: $v4, Reserved: ${reservedBytes.size} bytes")
+                Result.success(profile)
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
-
-            val code = conn.responseCode
-            if (code !in 200..204) {
-                val err = conn.errorStream?.bufferedReader()?.readText() ?: "HTTP $code"
-                Log.e(TAG, "WARP registration failed: $code $err")
-                return@withContext Result.failure(RuntimeException("WARP registration error: $code $err"))
-            }
-
-            val body = conn.inputStream.bufferedReader().readText()
-            val json = JSONObject(body)
-
-            val id = json.optString("id", "")
-            val token = json.optString("token", "")
-            val config = json.getJSONObject("config")
-            val iface = config.getJSONObject("interface")
-            val addrs = iface.getJSONObject("addresses")
-            val v4 = addrs.optString("v4", "172.16.0.2/32")
-            val v6 = addrs.optString("v6", "")
-
-            val peers = config.getJSONArray("peers")
-            val peer0 = peers.getJSONObject(0)
-            val peerPubKey = peer0.optString("public_key", "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=")
-            val endpointObj = peer0.optJSONObject("endpoint")
-            val endpointHost = endpointObj?.optString("host", "162.159.192.1:2408") ?: "162.159.192.1:2408"
-
-            // Extract reserved bytes: client_id in Cloudflare API is 3 bytes (encoded in base64 or hex)
-            val clientIdRaw = config.optString("client_id", "")
-            val reservedBytes = if (clientIdRaw.isNotEmpty()) {
-                try { Base64.decode(clientIdRaw, Base64.DEFAULT) } catch (_: Exception) { ByteArray(3) }
-            } else {
-                ByteArray(3)
-            }
-
-            val profile = WarpProfile(
-                privateKey = privKey,
-                publicKey = pubKey,
-                addressV4 = v4,
-                addressV6 = v6,
-                peerPublicKey = peerPubKey,
-                endpoint = endpointHost,
-                reserved = reservedBytes,
-                accountId = id,
-                token = token
-            )
-
-            Log.i(TAG, "WARP profile successfully registered! Address: $v4, Reserved: ${reservedBytes.size} bytes")
-            Result.success(profile)
         } catch (e: Exception) {
             Log.e(TAG, "WARP registration exception", e)
             Result.failure(e)
@@ -265,12 +227,13 @@ object WarpRegistrar {
      * Binds a WARP+ license key to an existing account.
      */
     suspend fun bindLicenseKey(accountId: String, token: String, licenseKey: String): Result<Boolean> = withContext(Dispatchers.IO) {
+        var conn: HttpURLConnection? = null
         try {
             val url = URL("$REGISTRATION_URL/$accountId/account")
-            val conn = url.openConnection() as HttpURLConnection
+            conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "PUT"
-            conn.connectTimeout = 10000
-            conn.readTimeout = 10000
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             conn.setRequestProperty("Authorization", "Bearer $token")
@@ -292,6 +255,8 @@ object WarpRegistrar {
         } catch (e: Exception) {
             Log.e(TAG, "Error binding WARP+ license", e)
             Result.failure(e)
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 }

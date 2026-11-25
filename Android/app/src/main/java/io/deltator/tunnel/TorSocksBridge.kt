@@ -1,5 +1,6 @@
 package io.deltator.tunnel
 
+import io.deltator.AppState
 import io.deltator.core.dns.FakeDns
 import io.deltator.util.AppLog as Log
 import java.io.BufferedOutputStream
@@ -44,6 +45,8 @@ object TorSocksBridge {
     private const val TCP_CONNECT_TIMEOUT_MS = 30000
     private const val DNS_TIMEOUT_MS = 15000
     private const val DNS_CACHE_TTL_MS = 300_000L
+    /** Same worker count the idle dnsExecutor pool was recreated with. */
+    private const val DNS_POOL_SIZE = 8
 
     enum class UpstreamMode {
         TOR,
@@ -143,15 +146,35 @@ object TorSocksBridge {
         acceptorThread?.interrupt()
         acceptorThread = null
 
-        connectionExecutor.shutdownNow()
+        // The two pools are replaced, not just shot down: a connection or a DNS
+        // answer that arrives a breath behind the shutdown would have hit a
+        // terminated pool and thrown RejectedExecutionException into whatever
+        // caller submitted it. A fresh pool accepts those stragglers and is torn
+        // down with the next stop, which is when they have long since run.
+        val oldConnectors = connectionExecutor
+        val oldDns = dnsExecutor
         connectionExecutor = Executors.newCachedThreadPool()
+        dnsExecutor = Executors.newFixedThreadPool(DNS_POOL_SIZE)
 
-        dnsExecutor.shutdownNow()
-        dnsExecutor = Executors.newFixedThreadPool(8)
+        oldConnectors.shutdownNow()
+        oldDns.shutdownNow()
 
         dnsCache.clear()
 
         logd("Bridge stopped")
+    }
+
+    /**
+     * Submit to [connectionExecutor] in a form that survives a stop racing a
+     * submit: the pool may be freshly replaced mid-call, and a task that loses
+     * that race is dropped, not reported as a failure of the connection.
+     */
+    private fun submitConnection(task: () -> Unit) {
+        try {
+            connectionExecutor.submit(task)
+        } catch (e: Exception) {
+            Log.w(TAG, "connection task rejected (shutting down?): ${e.javaClass.simpleName}")
+        }
     }
 
     fun isRunning(): Boolean = running.get()
@@ -203,7 +226,11 @@ object TorSocksBridge {
     }
 
     private fun handleConnection(clientSocket: Socket) {
-        connectionExecutor.submit {
+        // A submit can arrive between the pools being swapped out in stop() and
+        // the acceptor being told to quit. The old code let the rejection
+        // propagate; wrapped, it is one lost probe-shaped connection.
+        try {
+            connectionExecutor.submit {
             try {
                 clientSocket.use { socket ->
                     socket.soTimeout = 30000
@@ -294,6 +321,9 @@ object TorSocksBridge {
                 }
             }
         }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            Log.w(TAG, "connection handler rejected (bridge is stopping)")
+        }
     }
 
     /**
@@ -332,7 +362,7 @@ object TorSocksBridge {
 
         // For raw IP destinations on TLS port 443 (e.g. apps bypassing system DNS or direct IPs),
         // sniff SNI to recover the domain so Tor routes by hostname rather than blocked IP.
-        if (DomainRouter.isIpAddress(effectiveHost) && destPort == 443) {
+        if (DomainRouter.isIpAddress(effectiveHost) && (destPort == 443 || destPort == 80)) {
             clientOutput.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
             clientOutput.flush()
             clientSocket.soTimeout = 3000
@@ -364,16 +394,16 @@ object TorSocksBridge {
                 }
             }
             UpstreamMode.WARP -> {
-                connectDirectUpstream("WARP", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("WARP", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
             UpstreamMode.AMNEZIA -> {
-                connectDirectUpstream("Amnezia", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("Amnezia", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
             UpstreamMode.MASQUE -> {
-                connectDirectUpstream("MASQUE", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("MASQUE", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
             UpstreamMode.DIRECT -> {
-                connectDirectUpstream("Direct", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("Direct", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
         }
     }
@@ -405,24 +435,13 @@ object TorSocksBridge {
         sendReply: Boolean = true
     ) {
         logd("CONNECT: chained via Tor -> $mode for $destHost:$destPort")
-        val upstreamEp = when (mode) {
-            ChainMode.MASQUE -> parseEndpoint(masqueEndpoint)
-            ChainMode.WARP -> warpProfile?.endpoint?.let { parseEndpoint(it) }
-            ChainMode.AMNEZIA -> amneziaConfig?.endpoint?.let { parseEndpoint(it) }
-            else -> null
+        Log.e(TAG, "CONNECT: Chained multi-hop with $mode requires ChainOrchestrator. Rejecting plaintext HTTP CONNECT fallback (fail-closed).")
+        if (sendReply) {
+            try {
+                clientOutput.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                clientOutput.flush()
+            } catch (_: Exception) {}
         }
-
-        if (upstreamEp != null) {
-            val success = connectViaTorDoubleHop(
-                upstreamEp.first, upstreamEp.second,
-                destHost, destPort, rawAddr, portBytes,
-                clientSocket, clientInput, clientOutput, sendReply
-            )
-            if (success) return
-        }
-
-        // Direct Tor circuit fallback
-        connectViaTor(destHost, destPort, rawAddr, portBytes, clientSocket, clientInput, clientOutput, sendReply = sendReply)
     }
 
     private fun connectViaTorDoubleHop(
@@ -437,126 +456,29 @@ object TorSocksBridge {
         clientOutput: OutputStream,
         sendReply: Boolean
     ): Boolean {
-        var remoteSocket: Socket? = null
-        try {
-            remoteSocket = Socket()
-            remoteSocket.connect(InetSocketAddress(torHost, torSocksPort), TCP_CONNECT_TIMEOUT_MS)
-            remoteSocket.tcpNoDelay = true
-
-            val remoteInput = remoteSocket.getInputStream()
-            val remoteOutput = remoteSocket.getOutputStream()
-
-            // 1. SOCKS5 greeting to Tor
-            remoteOutput.write(byteArrayOf(0x05, 0x01, 0x00))
-            remoteOutput.flush()
-
-            val greetResp = ByteArray(2)
-            remoteInput.readFully(greetResp)
-            if (greetResp[0] != 0x05.toByte() || greetResp[1] != 0x00.toByte()) {
-                remoteSocket.close()
-                return false
-            }
-
-            // 2. CONNECT to upstream proxy via Tor
-            val hostBytes = upstreamHost.toByteArray(Charsets.US_ASCII)
-            val upPortBytes = byteArrayOf((upstreamPort shr 8).toByte(), (upstreamPort and 0xFF).toByte())
-            val upReq = byteArrayOf(0x05, 0x01, 0x00, 0x03, hostBytes.size.toByte()) + hostBytes + upPortBytes
-            remoteOutput.write(upReq)
-            remoteOutput.flush()
-
-            val torResp = ByteArray(4)
-            remoteInput.readFully(torResp)
-            if (torResp[1] != 0x00.toByte()) {
-                remoteSocket.close()
-                return false
-            }
-            when (torResp[3].toInt() and 0xFF) {
-                0x01 -> { val rest = ByteArray(6); remoteInput.readFully(rest) }
-                0x03 -> { val len = remoteInput.read(); val rest = ByteArray(len + 2); remoteInput.readFully(rest) }
-                0x04 -> { val rest = ByteArray(18); remoteInput.readFully(rest) }
-            }
-
-            // 3. Negotiate HTTP CONNECT with upstream proxy
-            val connectHttp = "CONNECT $destHost:$destPort HTTP/1.1\r\nHost: $destHost:$destPort\r\nProxy-Connection: Keep-Alive\r\nUser-Agent: DeltaTor/2.0\r\n\r\n"
-            remoteOutput.write(connectHttp.toByteArray(Charsets.US_ASCII))
-            remoteOutput.flush()
-
-            val reader = java.io.BufferedReader(java.io.InputStreamReader(remoteInput, Charsets.US_ASCII))
-            val statusLine = reader.readLine() ?: ""
-            if (!statusLine.contains("200")) {
-                logd("CONNECT: double-hop upstream returned status: $statusLine")
-                remoteSocket.close()
-                return false
-            }
-            while (true) {
-                val line = reader.readLine()
-                if (line.isNullOrEmpty()) break
-            }
-
-            logd("CONNECT: double-hop Tor -> $upstreamHost:$upstreamPort -> $destHost:$destPort OK")
-
-            if (sendReply) {
-                clientOutput.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+        Log.e(TAG, "CONNECT: Plaintext HTTP CONNECT double-hop rejected (fail-closed). Real multi-hop requires ChainOrchestrator.")
+        if (sendReply) {
+            try {
+                clientOutput.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 clientOutput.flush()
-            }
-            clientSocket.soTimeout = 0
-
-            remoteSocket.use { remote ->
-                val t1 = Thread({
-                    try {
-                        copyStream(clientInput, remoteOutput)
-                    } catch (_: Exception) {
-                    } finally {
-                        try { remoteOutput.close() } catch (_: Exception) {}
-                    }
-                }, "tor-bridge-chain-c2s")
-                t1.isDaemon = true
-                t1.start()
-
-                try {
-                    copyStream(remoteInput, clientOutput)
-                } catch (_: Exception) {
-                } finally {
-                    try { remote.close() } catch (_: Exception) {}
-                    t1.interrupt()
-                }
-            }
-            return true
-        } catch (e: Exception) {
-            logd("CONNECT: double-hop failed: ${e.message}")
-            try { remoteSocket?.close() } catch (_: Exception) {}
-            return false
+            } catch (_: Exception) {}
         }
+        return false
     }
 
-    private fun connectDirectUpstream(
+    private fun connectFailClosed(
         label: String,
         destHost: String,
         destPort: Int,
-        clientSocket: Socket,
-        clientInput: InputStream,
         clientOutput: OutputStream,
         sendReply: Boolean = true
     ) {
-        try {
-            val remoteSocket = Socket()
-            remoteSocket.connect(InetSocketAddress(destHost, destPort), TCP_CONNECT_TIMEOUT_MS)
-            remoteSocket.tcpNoDelay = true
-            if (sendReply) {
-                clientOutput.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+        Log.e(TAG, "CONNECT: Plaintext upstream rejected (fail-closed) for $label to $destHost:$destPort. Standalone tunnel requires netcore backend.")
+        if (sendReply) {
+            try {
+                clientOutput.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 clientOutput.flush()
-            }
-            clientSocket.soTimeout = 0
-            logd("CONNECT: $label direct connection OK to $destHost:$destPort")
-            bridgeDirect(clientInput, clientOutput, remoteSocket)
-        } catch (e: Exception) {
-            logd("CONNECT: $label failed to connect to $destHost:$destPort: ${e.message}")
-            if (sendReply) {
-                try {
-                    clientOutput.write(byteArrayOf(0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-                    clientOutput.flush()
-                } catch (_: Exception) {}
-            }
+            } catch (_: Exception) {}
         }
     }
 
@@ -644,16 +566,16 @@ object TorSocksBridge {
                 }
             }
             UpstreamMode.WARP -> {
-                connectDirectUpstream("WARP", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("WARP", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
             UpstreamMode.AMNEZIA -> {
-                connectDirectUpstream("Amnezia", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("Amnezia", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
             UpstreamMode.MASQUE -> {
-                connectDirectUpstream("MASQUE", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("MASQUE", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
             UpstreamMode.DIRECT -> {
-                connectDirectUpstream("Direct", effectiveHost, destPort, clientSocket, effectiveInput, clientOutput, sendReply = !wasEarlyReply)
+                connectFailClosed("Direct", effectiveHost, destPort, clientOutput, sendReply = !wasEarlyReply)
             }
         }
     }
@@ -823,7 +745,8 @@ object TorSocksBridge {
             // Dispatch DNS query to thread pool for concurrent resolution
             val addrCopy = addrBytes.copyOf()
             val payloadCopy = payload.copyOf()
-            dnsExecutor.submit {
+            try {
+                dnsExecutor.submit {
                 try {
                     // Check FakeDNS first (0ms synthetic response in 198.18.0.0/15)
                     val fakeResp = if (FakeDns.enabled) FakeDns.handleDnsQuery(payloadCopy) else null
@@ -837,7 +760,11 @@ object TorSocksBridge {
                             logd("DNS: cache hit")
                             cached
                         } else {
-                            val remote = resolveThroughTor(payloadCopy)
+                            val remote = if (upstreamMode == UpstreamMode.TOR && torSocksPort > 0) {
+                                resolveThroughTor(payloadCopy)
+                            } else {
+                                null
+                            }
                             if (remote != null) cacheDnsResponse(payloadCopy, remote)
                             remote
                         }
@@ -859,6 +786,9 @@ object TorSocksBridge {
                 } catch (e: Exception) {
                     logd("FWD_UDP: DNS forward failed: ${e.message}")
                 }
+            }
+            } catch (e: java.util.concurrent.RejectedExecutionException) {
+                Log.w(TAG, "DNS task rejected (bridge is stopping)")
             }
         }
 
@@ -923,6 +853,7 @@ object TorSocksBridge {
 
     /** Ask each resolver in turn over Tor; null when none answers. */
     private fun resolveThroughTor(payload: ByteArray): ByteArray? {
+        if (torSocksPort <= 0) return null
         for (resolver in DNS_FALLBACK_RESOLVERS) {
             val response = forwardDnsTcp(resolver, payload)
             if (response != null) return response
@@ -1066,6 +997,17 @@ object TorSocksBridge {
                 t1.interrupt()
             }
         }
+    }
+
+    private fun readHttpLine(input: InputStream): String {
+        val baos = java.io.ByteArrayOutputStream()
+        while (true) {
+            val b = input.read()
+            if (b == -1) break
+            if (b == '\n'.code) break
+            if (b != '\r'.code) baos.write(b)
+        }
+        return baos.toString("US-ASCII")
     }
 
     private fun copyStream(input: InputStream, output: OutputStream) {

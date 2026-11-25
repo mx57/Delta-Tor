@@ -65,7 +65,13 @@ that still gets through on heavily filtered networks.
 
 - **Exit country, live** — pick any countries; the app steers even *existing* circuits
   over the control port, so you can change country without reconnecting, and it verifies
-  the real exit IP afterwards and shows the country and address.
+  the real exit IP afterwards and shows the country and address. The **EXIT LOCATION**
+  button on the main screen lists every country with its running exits and capacity share;
+  a change here is steered into the live session immediately.
+- **New identity** — one button on the main screen (and a row in the notification) that
+  sends `SIGNAL NEWNYM` over the control port of the winning Tor client and re-probes the
+  exit, so the next streams leave through fresh circuits. Gated to the Tor engine without
+  a proxy chain, because a chain owns its exit.
 - **Proxy chain over VPN Gate** — add a second hop: Tor → SSTP → a public VPN Gate server
   → internet, with a country-sorted server list, live latency tests of every server, and
   automatic fallback to the next best server — never to a dead connection.
@@ -86,6 +92,45 @@ that still gets through on heavily filtered networks.
   with system-proxy and full-tunnel modes and a tray icon, shipped as a zip you unpack
   anywhere.
 - **No accounts, no analytics, no telemetry, no crash reporting** on the main builds.
+
+## Security Invariants & Fail-Closed Guarantee
+
+DeltaTor implements a strict **fail-closed security model**:
+- **Zero Plaintext Fallback:** Under no circumstance does traffic bypass an established or requested tunnel in plaintext. Silent bypasses, `connectDirectUpstream` fallbacks, unencrypted HTTP CONNECT tunnels, and disabled certificate checks are strictly prohibited and eliminated.
+- **Strict Killswitch:** Network capture uses `builder.setBlocking(true)`. If a tunnel backend fails to initialize, negotiate, or drops unexpectedly, all outbound traffic is blocked and rolled back atomically to avoid IP/DNS leaks.
+- **Constant-Time Proxy Authentication:** Local SOCKS5 proxy authentication uses RFC 1929 with cryptographic constant-time comparison (`MessageDigest.isEqual` / `CryptographicOperations.FixedTimeEquals`) to prevent timing side-channel attacks.
+- **Cryptographic Supply-Chain Security:** Tor and lyrebird binaries are verified via SHA-256 hashes against trusted release manifests; CI/CD actions are pinned to full 40-character commit SHAs.
+
+## Multi-Hop Transport Matrix
+
+DeltaTor supports multi-hop chaining combining Tor, AmneziaWG, Cloudflare WARP, and MASQUE (HTTP/3 Datagrams):
+
+| Preset Chain | Entry Hop | Middle Hop | Exit Hop | Primary Use Case |
+|---|---|---|---|---|
+| **Direct → Tor** | Direct / Bridges | — | Tor Exit | Standard anonymous browsing & censorship circumvention |
+| **Tor → WARP** | Tor Multi-path | — | Cloudflare Anycast | Tor anonymity + residential/CDN IP reputation (bypasses Tor captchas) |
+| **AmneziaWG → Tor** | AmneziaWG (DPI-resistant) | — | Tor Exit | Bypasses severe ISP handshake DPI, exits via Tor network |
+| **Tor → AmneziaWG** | Tor Multi-path | — | Private AWG Server | Anonymous Tor entry with dedicated private high-speed exit |
+| **Tor → MASQUE** | Tor Multi-path | — | HTTP/3 Proxy | QUIC datagram encapsulation over Tor circuits |
+| **Tor → AWG → WARP** | Tor Multi-path | AmneziaWG | Cloudflare Anycast | Maximum censorship defense with Anycast exit |
+| **Tor → SSTP** | Tor Multi-path | — | VPN Gate | Legacy free public double-hop |
+
+## Building Go Netcore (`Android/netcore`)
+
+The multi-hop transport data plane is implemented in Go for high throughput and cross-platform reliability.
+
+### Prerequisites
+- Go 1.22 or newer
+- Android NDK (r26b or r29)
+- `gomobile` and `gobind` (installed automatically by build script if missing)
+
+### Build Command
+```bash
+# Build the native netcore AAR for Android:
+chmod +x Android/scripts/build-netcore.sh
+./Android/scripts/build-netcore.sh
+```
+When building via Gradle (`./gradlew assembleDebug`), the `buildNetcore` task will automatically compile the Go module if Go is present in your environment.
 
 ## Install
 
@@ -111,7 +156,8 @@ next to the exe. Full-tunnel mode asks Windows for administrator rights when it 
 - **The ring** is the whole interface: tap to connect, tap again to reconnect. Everything
   else lives behind the hamburger drawer.
 - **Notification** shows live down/up speed and running totals, plus disconnect actions —
-  including a chain-aware disconnect when a proxy chain is running.
+  including a chain-aware disconnect when a proxy chain is running, and a *New identity*
+  row to rotate the live Tor circuits.
 - **Stop vs disconnect**: *Stop VPN* tears the tunnel down but keeps Tor warm, so the next
   connect skips the slow parts; *Disconnect* ends the session and the next connect is a
   fresh race.

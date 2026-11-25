@@ -93,6 +93,45 @@ that still gets through on heavily filtered networks.
   anywhere.
 - **No accounts, no analytics, no telemetry, no crash reporting** on the main builds.
 
+## Security Invariants & Fail-Closed Guarantee
+
+DeltaTor implements a strict **fail-closed security model**:
+- **Zero Plaintext Fallback:** Under no circumstance does traffic bypass an established or requested tunnel in plaintext. Silent bypasses, `connectDirectUpstream` fallbacks, unencrypted HTTP CONNECT tunnels, and disabled certificate checks are strictly prohibited and eliminated.
+- **Strict Killswitch:** Network capture uses `builder.setBlocking(true)`. If a tunnel backend fails to initialize, negotiate, or drops unexpectedly, all outbound traffic is blocked and rolled back atomically to avoid IP/DNS leaks.
+- **Constant-Time Proxy Authentication:** Local SOCKS5 proxy authentication uses RFC 1929 with cryptographic constant-time comparison (`MessageDigest.isEqual` / `CryptographicOperations.FixedTimeEquals`) to prevent timing side-channel attacks.
+- **Cryptographic Supply-Chain Security:** Tor and lyrebird binaries are verified via SHA-256 hashes against trusted release manifests; CI/CD actions are pinned to full 40-character commit SHAs.
+
+## Multi-Hop Transport Matrix
+
+DeltaTor supports multi-hop chaining combining Tor, AmneziaWG, Cloudflare WARP, and MASQUE (HTTP/3 Datagrams):
+
+| Preset Chain | Entry Hop | Middle Hop | Exit Hop | Primary Use Case |
+|---|---|---|---|---|
+| **Direct → Tor** | Direct / Bridges | — | Tor Exit | Standard anonymous browsing & censorship circumvention |
+| **Tor → WARP** | Tor Multi-path | — | Cloudflare Anycast | Tor anonymity + residential/CDN IP reputation (bypasses Tor captchas) |
+| **AmneziaWG → Tor** | AmneziaWG (DPI-resistant) | — | Tor Exit | Bypasses severe ISP handshake DPI, exits via Tor network |
+| **Tor → AmneziaWG** | Tor Multi-path | — | Private AWG Server | Anonymous Tor entry with dedicated private high-speed exit |
+| **Tor → MASQUE** | Tor Multi-path | — | HTTP/3 Proxy | QUIC datagram encapsulation over Tor circuits |
+| **Tor → AWG → WARP** | Tor Multi-path | AmneziaWG | Cloudflare Anycast | Maximum censorship defense with Anycast exit |
+| **Tor → SSTP** | Tor Multi-path | — | VPN Gate | Legacy free public double-hop |
+
+## Building Go Netcore (`Android/netcore`)
+
+The multi-hop transport data plane is implemented in Go for high throughput and cross-platform reliability.
+
+### Prerequisites
+- Go 1.22 or newer
+- Android NDK (r26b or r29)
+- `gomobile` and `gobind` (installed automatically by build script if missing)
+
+### Build Command
+```bash
+# Build the native netcore AAR for Android:
+chmod +x Android/scripts/build-netcore.sh
+./Android/scripts/build-netcore.sh
+```
+When building via Gradle (`./gradlew assembleDebug`), the `buildNetcore` task will automatically compile the Go module if Go is present in your environment.
+
 ## Install
 
 Grab the asset you need from the

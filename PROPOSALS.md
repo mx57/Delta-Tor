@@ -99,3 +99,64 @@ DeltaTor в настоящее время представляет собой с
 18. **Децентрализованное обновление мостов (Out-of-Band Bridge Distribution):**
     - *Проблема:* Зависимость от GitHub Releases / репозиториев; блокировка GitHub лишает клиент обновлений мостов.
     - *Решение:* Fallback-каналы получения списков мостов через Telegram MTProto / DoH TXT записи.
+
+---
+
+## 3. Реестр исправлений аудита безопасности (Security Audit & Remediation Log)
+
+В рамках комплексного аудита безопасности и архитектурной модернизации реализованы следующие ключевые этапы:
+
+### Этап 0: Предотвращение утечек данных и Fail-Closed защита (P0)
+- **Устранение `connectDirectUpstream` и незашифрованного HTTP CONNECT:**
+  - В `TorSocksBridge.kt` полностью удалены любые ветки прямого соединения в открытом виде при ошибках Tor.
+  - Исключено поведение fail-open: при любой ошибке туннеля соединение немедленно сбрасывается (`closeQuietly()`), предотвращая утечку реального IP пользователя.
+- **Защита Tor Control Port:**
+  - В `TorRunner.kt` (Android) и `TorRunner.cs` (Windows) аутентификация переведена на механизм cookie (`CookieAuthentication 1`, `CookieAuthFileGroupReadable 0`).
+  - Каталоги данных Tor защищены правами доступа (0700), исключающими чтение cookie сторонними приложениями.
+- **Валидация строк мостов:**
+  - Реализован строгий парсер `BridgeLineValidator.kt` и `DoHBridgeFetcher.kt`, проверяющий корректность IPv4/IPv6/FQDN и отсекающий вредоносные внедрения в конфигурацию `torrc`.
+- **Аутентификация локального SOCKS5 в константное время:**
+  - Внедрена RFC 1929 авторизация с использованием `MessageDigest.isEqual` (Android) и `CryptographicOperations.FixedTimeEquals` (Windows) для защиты от атак по времени (timing side-channel).
+- **Криптографическая безопасность X25519:**
+  - В `WarpRegistrar.kt` генерация ключей и вычисление скалярного произведения Curve25519 переведены на библиотеку BouncyCastle (`X25519.scalarMult`), верифицированы по официальным тестовым векторам RFC 7748.
+
+### Этап 1: Безопасность обновлений и цепочки поставок (P0/P1)
+- **Криптографическая валидация обновлений (Ed25519):**
+  - В `ReleaseChecker.kt`, `InstallResultReceiver.kt` и `ReleaseChecker.cs` добавлена проверка цифровых подписей манифестов релизов.
+- **Проверка целостности бинарных файлов (SHA-256):**
+  - В скрипте `Windows/fetch-binaries.ps1` зафиксированы и проверяются контрольные суммы SHA-256 для Tor Expert Bundle и Se7enTun.
+- **Фиксация зависимостей в CI/CD:**
+  - Все GitHub Actions во всех workflow зафиксированы по полным 40-символьным коммит-хэшам SHA.
+
+### Этап 2: Устранение состояний гонки и сбоев (P1)
+- **Windows:**
+  - Внедрен `ChildProcessTracker.cs` на базе Windows Job Object с флагом `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, гарантирующий мгновенное завершение всех дочерних процессов (`tor.exe`, `lyrebird.exe`) даже при аварийном завершении приложения.
+  - Атомарное сохранение и восстановление реестра WinINET в `SystemProxy.cs` для защиты от поломки системных настроек прокси.
+  - Флаг `ExclusiveAddressUse = true` на слушающих сокетах для предотвращения захвата портов другими приложениями.
+- **Android:**
+  - Реализован `PortAllocator.kt` взамен небезопасного `freeEphemeralPort`, исключающий TOCTOU гонки за локальные порты.
+  - Мьютекс жизненного цикла `lifecycleMutex` и потокобезопасная синхронизация состояния раннеров в `ParallelTorManager.kt` и `SstpChainEngine.kt`.
+
+### Этап 3: Высокопроизводительное Go ядро и Multi-Hop цепочки
+- Реализован модуль `Android/netcore/` на языке Go:
+  - Поддержка `ProtectedDirectDialer` с защитой сокетов Android через `VpnService.protect()`.
+  - Локальный аутентифицированный SOCKS5 сервер (`socks_server.go`).
+  - Адаптер UDP-over-TCP v2 (`uot.go`).
+  - Поддержка AmneziaWG (`awg.go`), Cloudflare WARP (`warp.go`) и MASQUE HTTP/3 (`masque.go`).
+  - Автоматическая компиляция через `build-netcore.sh` и Gradle-таску `buildNetcore`.
+- Реализован `ChainOrchestrator.kt` с динамическим расчетом MTU, изоляцией CSPRNG портов и 6 стандартными пресетами.
+- Построен UI конструктор цепочек `ChainBuilderScreen.kt` на Jetpack Compose.
+
+### Этап 4: Декомпозиция архитектуры
+- Исправлен парсер `AmneziaConfig.kt` с поддержкой комментариев (`#`, `;`) и hex-формата `h1..h4`.
+- Переписан `FakeDns.kt`: RFC 1035 парсер с защитой от циклов указателей сжатия (`0xC0`) и LRU-кэшем с TTL 5 минут.
+- Проведена полная декомпозиция монолита `TorVpnService.kt` (размер сокращен с 2621 до 283 строк):
+  - `VpnNotificationController.kt`: построение и обновление уведомлений.
+  - `VpnNetworkMonitor.kt`: мониторинг сети и режима экрана.
+  - `VpnStatsController.kt`: опрос трафика, watchdog соединения и локация exit-нод.
+  - `TunnelSessionCoordinator.kt`: оркестрация жизненного цикла сессий и бэкендов.
+
+### Этап 5: Автоматизированное тестирование
+- Создан проект юнит-тестирования Windows `DeltaTor.Core.Tests` (xUnit, .NET 8) с тестами `ChainProfile`, `LocalProxyAuth`, `SystemProxy`, `ReleaseChecker`.
+- Созданы тесты `FakeDnsTest.kt` для Android.
+- Шаги `dotnet test` и `testDebugUnitTest` интегрированы в CI/CD пайплайны GitHub Actions.

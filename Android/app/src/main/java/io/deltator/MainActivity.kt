@@ -442,7 +442,7 @@ private fun chainIntroNoticeBlocks(): List<AppState.NoticeBlock> = listOf(
 // store panel. Dark, borderless, owner-drawn and fully professional.
 // ---------------------------------------------------------------------------
 
-private enum class Screen { Main, Log, SplitTunnel }
+private enum class Screen { Main, Log, SplitTunnel, ChainBuilder }
 
 @Composable
 fun DeltaTorScreen(
@@ -464,6 +464,7 @@ fun DeltaTorScreen(
     val goMain = remember { { screen = Screen.Main } }
     val goLog = remember { { screen = Screen.Log } }
     val goSplit = remember { { screen = Screen.SplitTunnel } }
+    val goChainBuilder = remember { { screen = Screen.ChainBuilder } }
 
     Crossfade(targetState = screen, label = "screen") { s ->
         when (s) {
@@ -487,10 +488,34 @@ fun DeltaTorScreen(
                 },
                 onOpenLog = goLog,
                 onOpenSplitTunnel = goSplit,
+                onOpenChainBuilder = goChainBuilder,
                 openExitSheetTick = openExitSheetTick
             )
             Screen.Log -> LogScreen(onBack = goMain)
             Screen.SplitTunnel -> SplitTunnelScreen(onBack = goMain)
+            Screen.ChainBuilder -> io.deltator.ui.ChainBuilderScreen(
+                onBack = goMain,
+                onApplyChain = { plan ->
+                    io.deltator.util.AppLog.i("MainActivity", "Applied multi-hop chain: ${plan.name}")
+                    when (plan.name) {
+                        "Tor → WARP" -> onSelectChainMode(Config.TOR_CHAIN_WARP)
+                        "AmneziaWG → Tor", "Tor → AmneziaWG" -> onSelectChainMode(Config.TOR_CHAIN_AMNEZIA)
+                        "Tor → MASQUE" -> onSelectChainMode(Config.TOR_CHAIN_MASQUE)
+                        "Direct → Tor" -> onSelectChainMode(Config.TOR_CHAIN_NONE)
+                        else -> {
+                            if (plan.hops.any { it.type == io.deltator.core.chain.TransportHopType.WARP }) {
+                                onSelectChainMode(Config.TOR_CHAIN_WARP)
+                            } else if (plan.hops.any { it.type == io.deltator.core.chain.TransportHopType.AMNEZIA_WG }) {
+                                onSelectChainMode(Config.TOR_CHAIN_AMNEZIA)
+                            } else if (plan.hops.any { it.type == io.deltator.core.chain.TransportHopType.MASQUE }) {
+                                onSelectChainMode(Config.TOR_CHAIN_MASQUE)
+                            } else {
+                                onSelectChainMode(Config.TOR_CHAIN_NONE)
+                            }
+                        }
+                    }
+                }
+            )
         }
     }
 }
@@ -507,6 +532,7 @@ private fun MainScreen(
     onNewIdentity: () -> Unit,
     onOpenLog: () -> Unit,
     onOpenSplitTunnel: () -> Unit,
+    onOpenChainBuilder: () -> Unit = {},
     openExitSheetTick: Int = 0
 ) {
     val state by AppState.state.collectAsStateWithLifecycle()
@@ -659,7 +685,8 @@ private fun MainScreen(
                     onClose = closeDrawer,
                     onUpdateBridges = onUpdateBridges,
                     onOpenLog = { closeDrawer(); onOpenLog() },
-                    onOpenSplitTunnel = { closeDrawer(); onOpenSplitTunnel() }
+                    onOpenSplitTunnel = { closeDrawer(); onOpenSplitTunnel() },
+                    onOpenChainBuilder = { closeDrawer(); onOpenChainBuilder() }
                 )
             }
         }
@@ -1079,7 +1106,8 @@ private fun ControlDrawer(
     onClose: () -> Unit,
     onUpdateBridges: () -> Unit,
     onOpenLog: () -> Unit,
-    onOpenSplitTunnel: () -> Unit
+    onOpenSplitTunnel: () -> Unit,
+    onOpenChainBuilder: () -> Unit = {}
 ) {
     val uriHandler = LocalUriHandler.current
     val clipboard = LocalClipboard.current
@@ -1371,9 +1399,18 @@ private fun ControlDrawer(
         GradientPill(
             modifier = Modifier
                 .fillMaxWidth()
+                .padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 4.dp),
+            label = "CHAIN BUILDER",
+            filled = true,
+            onClick = onOpenChainBuilder
+        )
+
+        GradientPill(
+            modifier = Modifier
+                .fillMaxWidth()
                 .padding(start = 20.dp, end = 20.dp, top = 4.dp, bottom = 16.dp),
             label = "GITHUB",
-            filled = true,
+            filled = false,
             onClick = { runCatching { uriHandler.openUri(REPO_URL) } }
         )
     }

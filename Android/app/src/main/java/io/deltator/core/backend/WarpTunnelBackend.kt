@@ -172,7 +172,13 @@ class WarpTunnelBackend(
         val updated = current.copy(endpoint = next)
         profile = updated
         Config.warpConfig = updated.toJson()
-        Log.i(TAG, "Rotated WARP endpoint to $next (reconnect to apply)")
+        if (running) {
+            // Apply live update to active backend peer endpoint
+            bringUp(updated)
+            Log.i(TAG, "Rotated WARP endpoint to $next (applied live to active tunnel)")
+        } else {
+            Log.i(TAG, "Rotated WARP endpoint to $next (saved for next connection)")
+        }
         return next
     }
 

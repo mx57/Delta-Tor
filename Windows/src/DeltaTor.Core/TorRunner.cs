@@ -22,7 +22,7 @@ namespace DeltaTor.Core;
 ///   configured via `ClientTransportPlugin socks5 &lt;addr&gt;` pointing at the
 ///   PT's SOCKS5 listener.
 /// </summary>
-public sealed partial class TorRunner
+public sealed partial class TorRunner : IDisposable
 {
     private readonly string _tag;
     private readonly string _name;
@@ -41,6 +41,7 @@ public sealed partial class TorRunner
 
     private volatile Process? _torProcess;
     private volatile Process? _lyrebirdProcess;
+    private ManualResetEventSlim? _cmethodsDone;
 
     /// <summary>The loopback control port Tor binds when exit countries are selected.</summary>
     private volatile int _controlPort;
@@ -98,12 +99,21 @@ public sealed partial class TorRunner
 
     public bool IsRunning()
     {
-        var torOk = _torProcess is { HasExited: false };
-        var lyrebirdOk = _lyrebirdProcess == null || _lyrebirdProcess is { HasExited: false };
-        return torOk && lyrebirdOk;
+        lock (_stopLock)
+        {
+            var torOk = _torProcess is { HasExited: false };
+            var lyrebirdOk = _lyrebirdProcess == null || _lyrebirdProcess is { HasExited: false };
+            return torOk && lyrebirdOk;
+        }
     }
 
-    public bool IsReady() => _ready && _torProcess is { HasExited: false };
+    public bool IsReady()
+    {
+        lock (_stopLock)
+        {
+            return _ready && _torProcess is { HasExited: false };
+        }
+    }
 
     public int Progress() => Volatile.Read(ref _bootstrapPercent);
 
@@ -156,15 +166,32 @@ public sealed partial class TorRunner
     /// selected countries. Any line the binary rejects is left alone, traced,
     /// and the session continues with the exit list still in force.
     /// </summary>
+    private string? GetControlCookieHex()
+    {
+        try
+        {
+            var cookieFile = Path.Combine(_dataDir, "control_auth_cookie");
+            if (!File.Exists(cookieFile)) return null;
+            var bytes = File.ReadAllBytes(cookieFile);
+            return Convert.ToHexString(bytes).ToLowerInvariant();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private bool ApplyExitNodesViaControl(int port, IReadOnlyList<string> ccs)
     {
+        var cookieHex = GetControlCookieHex();
+        var authCmd = string.IsNullOrEmpty(cookieHex) ? "AUTHENTICATE" : $"AUTHENTICATE {cookieHex}";
         var exitValue = string.Join(",", ccs.Select(c => "{" + c + "}"));
         AppLog.I(TagExit, $"=== EXIT NODE |> {_name} |> {string.Join(",", ccs)} ===");
         AppLog.I(TagExit, $"[{_name}] official geoip in use for {string.Join(",", ccs)}");
         AppLog.I(TagExit, $"[{_name}] control port: {_listenHost}:{port}");
         return SendControl(port, new[]
         {
-            new ControlCommand("AUTHENTICATE", Optional: false),
+            new ControlCommand(authCmd, Optional: false),
             new ControlCommand($"SETCONF ExitNodes=\"{exitValue}\"", Optional: false),
             new ControlCommand("SETCONF StrictNodes=0", Optional: false),
             new ControlCommand("SETCONF MaxCircuitDirtiness=600", Optional: true),
@@ -187,10 +214,17 @@ public sealed partial class TorRunner
     private bool SendControl(int port, IReadOnlyList<ControlCommand> commands)
     {
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using var cts = new CancellationTokenSource(4_000);
         try
         {
-            if (!socket.ConnectAsync(IPAddress.Loopback, port).Wait(4_000))
-                throw new TimeoutException("connect timed out");
+            try
+            {
+                socket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, port), cts.Token).AsTask().GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                throw new TimeoutException($"connect timed out: {ex.Message}");
+            }
             socket.ReceiveTimeout = 4_000;
             socket.SendTimeout = 4_000;
             using var stream = new NetworkStream(socket, ownsSocket: false);
@@ -202,17 +236,18 @@ public sealed partial class TorRunner
                 stream.Flush();
                 var reply = ReadReply(reader);
                 var ok = reply.Count > 0 && reply[^1].StartsWith("250", StringComparison.Ordinal);
+                var safeCmd = command.Line.StartsWith("AUTHENTICATE", StringComparison.OrdinalIgnoreCase) ? "AUTHENTICATE [REDACTED]" : command.Line;
                 if (!ok)
                 {
                     if (command.Optional)
                     {
                         AppLog.W(TagExit,
-                            $"[{_name}] {command.Line} -> {string.Join(" / ", reply)} (ignored)");
+                            $"[{_name}] {safeCmd} -> {string.Join(" / ", reply)} (ignored)");
                         continue;
                     }
-                    throw new Exception($"{command.Line} -> {string.Join(" / ", reply)}");
+                    throw new Exception($"{safeCmd} -> {string.Join(" / ", reply)}");
                 }
-                AppLog.I(TagExit, $"[{_name}] {command.Line} -> {reply[^1]}");
+                AppLog.I(TagExit, $"[{_name}] {safeCmd} -> {reply[^1]}");
             }
             return true;
         }
@@ -270,18 +305,28 @@ public sealed partial class TorRunner
         var port = Volatile.Read(ref _controlPort);
         if (port <= 0) return null;
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using var cts = new CancellationTokenSource(2_000);
         try
         {
-            if (!socket.ConnectAsync(IPAddress.Loopback, port).Wait(2_000))
+            try
+            {
+                socket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, port), cts.Token).AsTask().GetAwaiter().GetResult();
+            }
+            catch
+            {
                 return null;
+            }
             socket.ReceiveTimeout = 2_000;
-            socket.SendTimeout = 2_000;
             using var stream = new NetworkStream(socket, ownsSocket: false);
             using var reader = new StreamReader(stream, Encoding.Latin1,
                 detectEncodingFromByteOrderMarks: false);
-            stream.Write(Encoding.Latin1.GetBytes("AUTHENTICATE\r\n"));
+            var cookieHex = GetControlCookieHex();
+            var authLine = string.IsNullOrEmpty(cookieHex) ? "AUTHENTICATE\r\n" : $"AUTHENTICATE {cookieHex}\r\n";
+            stream.Write(Encoding.Latin1.GetBytes(authLine));
             stream.Flush();
-            ReadReply(reader);
+            var authReply = ReadReply(reader);
+            if (authReply.Count == 0 || !authReply[^1].StartsWith("250", StringComparison.Ordinal))
+                return null;
             stream.Write(Encoding.Latin1.GetBytes("GETINFO traffic/read\r\n"));
             stream.Flush();
             var readReply = ReadReply(reader);
@@ -556,7 +601,11 @@ public sealed partial class TorRunner
 
             var process = Process.Start(psi)
                 ?? throw new InvalidOperationException("Process.Start returned null");
-            _torProcess = process;
+            ChildProcessTracker.Track(process);
+            lock (_stopLock)
+            {
+                _torProcess = process;
+            }
 
             StartReader(process.StandardOutput, "Tor: ", $"{_name}-tor-output");
             StartReader(process.StandardError, "Tor: ", $"{_name}-tor-error");
@@ -652,13 +701,17 @@ public sealed partial class TorRunner
         {
             process = Process.Start(psi)
                 ?? throw new InvalidOperationException("Process.Start returned null");
+            ChildProcessTracker.Track(process);
         }
         catch (Exception e)
         {
             AppLog.E(_tag, $"Failed to launch lyrebird: {e.Message}");
             return new Exception($"{_tag}: failed to launch lyrebird: {e.Message}");
         }
-        _lyrebirdProcess = process;
+        lock (_stopLock)
+        {
+            _lyrebirdProcess = process;
+        }
 
         var stderrThread = new Thread(() =>
         {
@@ -678,10 +731,9 @@ public sealed partial class TorRunner
         stderrThread.Name = $"{_name}-lyrebird-stderr";
         stderrThread.Start();
 
-        // Deliberately not disposed: the stdout reader thread may still call
-        // Set() long after this method returns (when the process finally closes
-        // its pipe), and a disposed event would crash that thread.
-        var cmethodsDone = new ManualResetEventSlim(initialState: false);
+        _cmethodsDone?.Dispose();
+        _cmethodsDone = new ManualResetEventSlim(initialState: false);
+        var cmethodsDone = _cmethodsDone;
         var protocolError = new string?[1];
 
         var stdoutThread = new Thread(() =>
@@ -841,9 +893,14 @@ public sealed partial class TorRunner
         }
 
         var templateLines = TorrcSettings.TemplateLines();
+        var cookieFile = Path.Combine(_dataDir, "control_auth_cookie");
         var torrcContent =
             $"{commonStr}\n{string.Join("\n", templateLines)}\n{pluginDirectives.ToString().Trim()}\n{bridgeDirectives.ToString().Trim()}\n" +
-            (_controlPort > 0 ? $"ControlPort {_listenHost}:{_controlPort}\n" : "");
+            (_controlPort > 0 ?
+                $"ControlPort {_listenHost}:{_controlPort}\n" +
+                $"CookieAuthentication 1\n" +
+                $"CookieAuthFile {Quote(cookieFile)}\n" +
+                $"CookieAuthFileGroupReadable 0\n" : "");
         File.WriteAllText(torrcFile, torrcContent);
         try
         {
@@ -851,12 +908,7 @@ public sealed partial class TorRunner
         }
         catch { /* not fatal */ }
 
-        AppLog.D(_tag, $"--- Generated torrc ({_name}) ---");
-        foreach (var line in ParallelTorManager.SplitLines(torrcContent))
-        {
-            if (!string.IsNullOrWhiteSpace(line)) AppLog.D(_tag, $"torrc: {line}");
-        }
-        AppLog.D(_tag, $"--- End torrc ({_name}) ---");
+        AppLog.D(_tag, $"Generated torrc written to {torrcFile} (runner {_name}, ControlPort={_controlPort}, CookieAuth=1)");
         return torrcFile;
     }
 
@@ -1007,4 +1059,12 @@ public sealed partial class TorRunner
 
     private static readonly HashSet<string> PluggableTransports = new(StringComparer.Ordinal)
         { "obfs4", "webtunnel", "snowflake", "meek_lite", "meek" };
+
+    public void Dispose()
+    {
+        Stop();
+        _exitAppliedDone.Dispose();
+        _cmethodsDone?.Dispose();
+        GC.SuppressFinalize(this);
+    }
 }

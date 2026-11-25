@@ -224,66 +224,34 @@ else {
 
 # ---------------------------------------------------------------------------
 # Fork core overlay: replace the official tor.exe (and its DLLs, and the geoip
-# pair) with the Delta-Kronecker/tor build. The 'latest' tag moves, so the pin
-# is the asset digest the GitHub API publishes for the release.
+# pair) with the Delta-Kronecker/tor build. Pinned to tag and explicit SHA-256.
 # ---------------------------------------------------------------------------
 $ForkTag       = 'latest'
 $ForkArchive   = 'tor-windows-x86_64.zip'
 $ForkDownload  = "https://github.com/Delta-Kronecker/tor/releases/download/$ForkTag/$ForkArchive"
-$ForkApi       = "https://api.github.com/repos/Delta-Kronecker/tor/releases/tags/$ForkTag"
+$ForkSha256    = '6dbad94fa198107b390e08f5af10afe8e714a88b2960be4e4cd1c7cc527cd4e0'
 $ForkMarker    = Join-Path $BundleRootResolved '.fork-core'
 
-function Get-ForkDigest {
-    $headers = @{ 'Accept' = 'application/vnd.github+json' }
-    if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
-    try {
-        $rel = Invoke-RestMethod -Uri $script:ForkApi -Headers $headers -TimeoutSec 30
-    }
-    catch {
-        Write-Warning "Fork release API call failed: $($_.Exception.Message)"
-        return $null
-    }
-    $asset = $rel.assets | Where-Object { $_.name -eq $script:ForkArchive } | Select-Object -First 1
-    if (-not $asset -or -not $asset.digest) {
-        Write-Warning "Fork release lists no digest for $script:ForkArchive."
-        return $null
-    }
-    if ($asset.digest -like 'sha256:*') { return $asset.digest.Substring(7).ToLowerInvariant() }
-    return $null
-}
-
-$forkDigest = Get-ForkDigest
-if (-not $forkDigest) {
-    if (Test-Path $ForkMarker) {
-        Write-Warning "Fork digest unreachable and a core is already applied; keeping it."
-    }
-    elseif ($CI) {
-        throw "Cannot resolve the fork core digest from the GitHub API; refusing to ship the official core in CI."
-    }
-    else {
-        Write-Warning "Fork digest unreachable and no core applied yet; the official core stays."
-    }
-}
-elseif ((Test-Path $ForkMarker) -and ((Get-Content $ForkMarker -Raw).Trim() -eq $forkDigest)) {
-    Write-Step "Fork core already applied ($forkDigest)"
+if ((Test-Path $ForkMarker) -and ((Get-Content $ForkMarker -Raw).Trim() -eq $ForkSha256)) {
+    Write-Step "Fork core already applied ($ForkSha256)"
 }
 else {
     $forkPath = Join-Path $CacheRoot $ForkArchive
     $needDownload = $true
     if (Test-Path $forkPath) {
         $cached = (Get-FileHash -Algorithm SHA256 -Path $forkPath).Hash.ToLowerInvariant()
-        if ($cached -eq $forkDigest) { $needDownload = $false; Write-Step "Found cached fork core: $forkPath" }
+        if ($cached -eq $ForkSha256) { $needDownload = $false; Write-Step "Found cached fork core: $forkPath" }
     }
     if ($needDownload) {
         Write-Step "Downloading $ForkDownload"
         curl.exe -fsSL --retry 3 --retry-delay 2 -o $forkPath $ForkDownload
         if ($LASTEXITCODE -ne 0) { throw "Download failed (curl exit $LASTEXITCODE): $ForkDownload" }
-        $forkActual = (Get-FileHash -Algorithm SHA256 -Path $forkPath).Hash.ToLowerInvariant()
-        if ($forkActual -ne $forkDigest) {
-            throw "SHA-256 mismatch for $forkPath. Release digest $forkDigest but got $forkActual"
-        }
     }
-    Write-Step "Fork core SHA-256 verified: $forkDigest"
+    $forkActual = (Get-FileHash -Algorithm SHA256 -Path $forkPath).Hash.ToLowerInvariant()
+    if ($forkActual -ne $ForkSha256) {
+        throw "SHA-256 mismatch for $forkPath. Pinned $ForkSha256 but got $forkActual"
+    }
+    Write-Step "Fork core SHA-256 verified: $ForkSha256"
 
     $forkTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("deltator-fork-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $forkTemp | Out-Null

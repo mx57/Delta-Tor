@@ -10,6 +10,7 @@ import snowflake.SnowflakeClient
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -172,11 +173,12 @@ class TorRunner(
     }
 
     /**
-     * A free loopback port for the control listener. ServerSocket(0) picks one
-     * from the ephemeral range; the small re-bind race is acceptable here and a
-     * runner that wins only ever needs it after its own bootstrap.
+     * A free loopback port allocated safely via [PortAllocator] with retry logic
+     * and collision tracking.
      */
-    private fun freeEphemeralPort(): Int = java.net.ServerSocket(0).use { it.localPort }
+    private fun freeEphemeralPort(): Int = PortAllocator.allocateFreePort(listenHost)
+
+    private val dnsttPorts = Collections.synchronizedList(mutableListOf<Int>())
 
     // Ring buffer of this runner's own log lines, so a dead process can be
     // explained after the fact (Tor's own words, not a generic "process exited").
@@ -560,6 +562,7 @@ class TorRunner(
                 val domain = args["domain"] ?: throw RuntimeException("missing domain=")
 
                 val listenPort = freeEphemeralPort()
+                dnsttPorts.add(listenPort)
                 val listenAddr = "$listenHost:$listenPort"
                 val client = Mobile.newClient(resolver, domain, pubkey, listenAddr)
                 client.start()
@@ -694,7 +697,11 @@ class TorRunner(
 
         val bridgeDirectives = StringBuilder()
         for (line in cleanLines) {
-            bridgeDirectives.appendLine("Bridge $line")
+            if (BridgeLineValidator.isValidBridgeLine(line)) {
+                bridgeDirectives.appendLine("Bridge $line")
+            } else {
+                Log.w(tag, "Rejected invalid or potentially malicious bridge line: $line")
+            }
         }
 
         // Exit-country steering is applied AFTER bootstrap via the control port
@@ -716,18 +723,18 @@ class TorRunner(
         controlPort = freeEphemeralPort()
 
         val templateLines = TorrcSettings.mobileConfluxLines(TorrcSettings.isMobileData(context))
+        val cookieFile = File(dataDir, "control_auth_cookie")
         val torrcContent = "$common\n${templateLines.joinToString("\n")}\n${pluginDirectives.toString().trim()}\n${bridgeDirectives.toString().trim()}\n" +
-            "ControlPort $listenHost:$controlPort\n"
+            "ControlPort $listenHost:$controlPort\n" +
+            "CookieAuthentication 1\n" +
+            "CookieAuthFile ${cookieFile.absolutePath}\n" +
+            "CookieAuthFileGroupReadable 0\n"
         torrcFile.writeText(torrcContent)
         try {
             File(context.filesDir, "tor_last.torrc").writeText(torrcContent)
         } catch (_: Exception) {}
 
-        Log.d(tag, "--- Generated torrc ($name) ---")
-        torrcContent.lines().forEach { line ->
-            if (line.isNotBlank()) Log.d(tag, "torrc: $line")
-        }
-        Log.d(tag, "--- End torrc ($name) ---")
+        Log.d(tag, "Generated torrc written to ${torrcFile.absolutePath} (runner $name, ControlPort=$controlPort, CookieAuth=1)")
         return torrcFile.absolutePath
     }
 
@@ -792,15 +799,29 @@ class TorRunner(
         val birdDead = terminate(bird, "lyrebird")
         confirmedStopped = (tor == null || torDead) && (bird == null || birdDead)
 
+        val oldControlPort = controlPort
+        controlPort = 0
+        if (oldControlPort > 0) {
+            PortAllocator.release(oldControlPort)
+        }
+
         val dnstts = synchronized(dnsttClients) { dnsttClients.toList().also { dnsttClients.clear() } }
         dnstts.forEach { client -> runCatching { client.stop() } }
         if (dnstts.isNotEmpty()) {
             Log.i(tag, "stopped ${dnstts.size} dnstt client(s)")
         }
+        synchronized(dnsttPorts) {
+            dnsttPorts.forEach { PortAllocator.release(it) }
+            dnsttPorts.clear()
+        }
 
         val sf = snowflakeClient
+        val oldSfPort = snowflakePort
         snowflakeClient = null
         snowflakePort = 0
+        if (oldSfPort > 0) {
+            PortAllocator.release(oldSfPort)
+        }
         if (sf != null) {
             runCatching { sf.stop() }
             Log.i(tag, "stopped snowflake client")

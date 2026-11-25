@@ -237,15 +237,19 @@ public static partial class ParallelTorManager
             p.Key,
             IsMemoryRunner(p.Key) ? MemoryRunnerLinesOf(p.Value) : Shuffled(p.Value))).ToList();
 
-        var planNames = plans.Select(p => p.Key).ToHashSet(StringComparer.Ordinal);
-        _lastPlans = plans.ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal);
-        _lastPorts = allPorts.Where(kv => planNames.Contains(kv.Key))
-            .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+        lock (RunnersLock)
+        {
+            var planNames = plans.Select(p => p.Key).ToHashSet(StringComparer.Ordinal);
+            _lastPlans = plans.ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal);
+            _lastPorts = allPorts.Where(kv => planNames.Contains(kv.Key))
+                .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+        }
 
         var gen = BeginRunners();
 
         foreach (var (name, bridgeLines) in preparedPlans)
         {
+            CheckGeneration(gen);
             var runner = new TorRunner(name, allPorts[name], bridgeLines);
             lock (RunnersLock)
             {
@@ -277,6 +281,7 @@ public static partial class ParallelTorManager
         IReadOnlyDictionary<string, TorRunner> lastSeen =
             new Dictionary<string, TorRunner>(StringComparer.Ordinal);
 
+        TorRunner? winner = null;
         var deadline = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + RaceTimeoutMs;
         try
         {
@@ -310,7 +315,7 @@ public static partial class ParallelTorManager
                     RecordMemory(sessionId, r);
                 }
 
-                var winner = lastSeen.Values.FirstOrDefault(r => r.IsReady());
+                winner = lastSeen.Values.FirstOrDefault(r => r.IsReady());
                 if (winner != null)
                 {
                     AppLog.I(TAG, $"Winner: {winner.Name} at {winner.Progress()}%");
@@ -364,6 +369,11 @@ public static partial class ParallelTorManager
             foreach (var r in lastSeen.Values.Where(r => recorded.Add(r.Name)))
             {
                 RecordMemory(sessionId, r);
+            }
+
+            if (winner == null)
+            {
+                StopAll();
             }
         }
     }

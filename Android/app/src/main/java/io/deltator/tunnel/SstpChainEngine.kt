@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 
 private const val TAG = "Chain"
@@ -62,6 +63,7 @@ class SstpChainEngine(private val service: TorVpnService) {
     @Volatile
     private var controller: Controller? = null
 
+    private val switchLock = Any()
     private val running = AtomicBoolean(false)
     private val deliberate = AtomicBoolean(false)
 
@@ -69,13 +71,15 @@ class SstpChainEngine(private val service: TorVpnService) {
     val isActive: Boolean get() = running.get()
 
     fun start(host: String, port: Int) {
-        if (!running.compareAndSet(false, true)) {
-            Log.i(TAG, "chain start ignored: already running")
-            return
+        synchronized(switchLock) {
+            if (!running.compareAndSet(false, true)) {
+                Log.i(TAG, "chain start ignored: already running")
+                return
+            }
+            deliberate.set(false)
+            restoreOnEnd = true
+            pendingSwitch = null
         }
-        deliberate.set(false)
-        restoreOnEnd = true
-        pendingSwitch = null
 
         setChain {
             it.copy(
@@ -98,12 +102,15 @@ class SstpChainEngine(private val service: TorVpnService) {
                     service.onChainExhausted(e.message ?: "internal error")
                 }
             } finally {
-                val restore = deliberate.get() && restoreOnEnd && pendingSwitch == null
-                val next = pendingSwitch
-                pendingSwitch = null
-                restoreOnEnd = true
-                deliberate.set(false)
-                running.set(false)
+                val (restore, next) = synchronized(switchLock) {
+                    val restore = deliberate.get() && restoreOnEnd && pendingSwitch == null
+                    val next = pendingSwitch
+                    pendingSwitch = null
+                    restoreOnEnd = true
+                    deliberate.set(false)
+                    running.set(false)
+                    Pair(restore, next)
+                }
                 if (restore) {
                     service.onChainStoppedByUser()
                 } else if (next != null) {
@@ -129,15 +136,17 @@ class SstpChainEngine(private val service: TorVpnService) {
     private var pendingSwitch: Pair<String, Int>? = null
 
     fun switchTo(host: String, port: Int) {
-        if (!running.get()) {
-            start(host, port)
-            return
-        }
-        pendingSwitch = host to port
-        restoreOnEnd = false
-        deliberate.set(true)
-        setChain {
-            it.copy(status = AppState.ChainStatus.STOPPING, host = host, port = port, message = "switching…")
+        synchronized(switchLock) {
+            if (!running.get()) {
+                start(host, port)
+                return
+            }
+            pendingSwitch = host to port
+            restoreOnEnd = false
+            deliberate.set(true)
+            setChain {
+                it.copy(status = AppState.ChainStatus.STOPPING, host = host, port = port, message = "switching…")
+            }
         }
         controller?.disconnect()
     }
@@ -147,19 +156,23 @@ class SstpChainEngine(private val service: TorVpnService) {
      * asked for, because whoever calls knows what the next state should be.
      */
     fun stopWithoutRestore() {
-        if (!running.get()) return
-        restoreOnEnd = false
-        deliberate.set(true)
-        setChain { it.copy(status = AppState.ChainStatus.STOPPING) }
+        synchronized(switchLock) {
+            if (!running.get()) return
+            restoreOnEnd = false
+            deliberate.set(true)
+            setChain { it.copy(status = AppState.ChainStatus.STOPPING) }
+        }
         controller?.disconnect()
     }
 
     /** The user pulled the plug: disconnect properly (SSTP Call Disconnect). */
     fun stop() {
-        if (!running.get()) return
-        restoreOnEnd = true
-        deliberate.set(true)
-        setChain { it.copy(status = AppState.ChainStatus.STOPPING) }
+        synchronized(switchLock) {
+            if (!running.get()) return
+            restoreOnEnd = true
+            deliberate.set(true)
+            setChain { it.copy(status = AppState.ChainStatus.STOPPING) }
+        }
         controller?.disconnect()
     }
 
@@ -242,8 +255,12 @@ class SstpChainEngine(private val service: TorVpnService) {
     private suspend fun runSession(host: String, port: Int): Outcome {
         val negotiated = CompletableDeferred<Unit>()
         val ended = CompletableDeferred<String>()
-        var lastLog = ""
+        val lastLog = AtomicReference("")
 
+        val verifyCert = Config.chainVerifyTlsCert
+        if (!verifyCert) {
+            Log.w(TAG, "SECURITY WARNING: SSTP TLS certificate verification is DISABLED. Vulnerable to MITM attacks!")
+        }
         val sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val bridge = SharedBridge(
             params = SstpParams(
@@ -254,7 +271,7 @@ class SstpChainEngine(private val service: TorVpnService) {
                 proxyPort = Config.proxyPort,
                 username = VPN_GATE_USER,
                 password = VPN_GATE_PASS,
-                doVerifyCert = Config.chainVerifyTlsCert,
+                doVerifyCert = verifyCert,
                 ownPackageName = service.packageName
             ),
             scope = sessionScope,
@@ -264,10 +281,10 @@ class SstpChainEngine(private val service: TorVpnService) {
                 socket != null && service.protect(socket)
             },
             log = { line ->
-                lastLog = line
+                lastLog.set(line)
                 Log.i(TAG, "[$host:$port] $line")
             },
-            onSessionEnded = { ended.complete(lastLog) },
+            onSessionEnded = { ended.complete(lastLog.get()) },
             onNegotiated = { negotiated.complete(Unit) }
         )
 

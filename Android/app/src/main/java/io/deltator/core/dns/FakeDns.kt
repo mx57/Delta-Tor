@@ -3,7 +3,6 @@ package io.deltator.core.dns
 import io.deltator.util.AppLog as Log
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -25,18 +24,24 @@ object FakeDns {
     private const val BASE_IP_START = 0xC6120001L // 198.18.0.1
     private const val IP_COUNT = 131070
     private const val MAX_ENTRIES = 10000
+    private const val TTL_MS = 300_000L // 5 minutes
+
+    private const val MAX_DNS_COMPRESSION_HOPS = 8
+
+    private data class IpEntry(val ip: String, var expiresAt: Long)
+    private data class DomainEntry(val domain: String, var expiresAt: Long)
 
     private val lock = Any()
-    private val domainToIp = object : LinkedHashMap<String, String>(1024, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
+    private val domainToIp = object : LinkedHashMap<String, IpEntry>(1024, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, IpEntry>?): Boolean {
             if (size > MAX_ENTRIES && eldest != null) {
-                ipToDomain.remove(eldest.value)
+                ipToDomain.remove(eldest.value.ip)
                 return true
             }
             return false
         }
     }
-    private val ipToDomain = HashMap<String, String>(1024)
+    private val ipToDomain = HashMap<String, DomainEntry>(1024)
     private val counter = AtomicInteger(0)
 
     @Volatile
@@ -54,17 +59,45 @@ object FakeDns {
     }
 
     /**
-     * Look up the domain name associated with a synthetic IP.
+     * Look up the domain name associated with a synthetic IP, respecting TTL expiration.
      */
-    fun getDomain(ip: String): String? = synchronized(lock) { ipToDomain[ip] }
+    fun getDomain(ip: String): String? = synchronized(lock) {
+        val entry = ipToDomain[ip] ?: return null
+        val now = System.currentTimeMillis()
+        if (now > entry.expiresAt) {
+            ipToDomain.remove(ip)
+            domainToIp.remove(entry.domain)
+            return null
+        }
+        entry.domain
+    }
 
     /**
-     * Look up or allocate a synthetic IP address for a given domain name.
+     * Look up or allocate a synthetic IP address for a given domain name with LRU and TTL tracking.
      */
     fun getOrAllocateIp(domain: String): String = synchronized(lock) {
         val cleanDomain = domain.lowercase().trimEnd('.')
+        val now = System.currentTimeMillis()
+
         val existing = domainToIp[cleanDomain]
-        if (existing != null) return existing
+        if (existing != null) {
+            existing.expiresAt = now + TTL_MS
+            val rev = ipToDomain[existing.ip]
+            if (rev != null) rev.expiresAt = now + TTL_MS
+            return existing.ip
+        }
+
+        // Purge expired entries if cache is full
+        if (domainToIp.size >= MAX_ENTRIES) {
+            val it = domainToIp.entries.iterator()
+            while (it.hasNext()) {
+                val e = it.next()
+                if (now > e.value.expiresAt) {
+                    ipToDomain.remove(e.value.ip)
+                    it.remove()
+                }
+            }
+        }
 
         val idx = Math.floorMod(counter.getAndIncrement(), IP_COUNT)
         val ipVal = BASE_IP_START + idx
@@ -75,14 +108,15 @@ object FakeDns {
         val ipStr = "$b1.$b2.$b3.$b4"
 
         // If ipStr was previously assigned to another domain, purge the old domain mapping
-        val oldDomain = ipToDomain.remove(ipStr)
-        if (oldDomain != null) {
-            domainToIp.remove(oldDomain)
+        val old = ipToDomain.remove(ipStr)
+        if (old != null) {
+            domainToIp.remove(old.domain)
         }
 
-        domainToIp[cleanDomain] = ipStr
-        ipToDomain[ipStr] = cleanDomain
-        Log.d(TAG, "Allocated synthetic IP $ipStr for domain $cleanDomain")
+        val expires = now + TTL_MS
+        domainToIp[cleanDomain] = IpEntry(ipStr, expires)
+        ipToDomain[ipStr] = DomainEntry(cleanDomain, expires)
+        Log.d(TAG, "Allocated synthetic IP $ipStr for domain $cleanDomain (TTL ${TTL_MS / 1000}s)")
         ipStr
     }
 
@@ -93,6 +127,56 @@ object FakeDns {
         domainToIp.clear()
         ipToDomain.clear()
         counter.set(0)
+    }
+
+    /**
+     * Parse domain name from DNS packet, supporting RFC 1035 Section 4.1.4 compression pointers (0xC0)
+     * with cycle detection and bounded hops (<= 8).
+     * Returns Pair(domain, nextOffsetInQuery) or null if malformed.
+     */
+    fun parseDomainName(bytes: ByteArray, startPos: Int): Pair<String, Int>? {
+        var pos = startPos
+        var nextPos = -1
+        var hops = 0
+        val sb = StringBuilder()
+
+        while (pos < bytes.size) {
+            val len = bytes[pos].toInt() and 0xFF
+            if (len == 0) {
+                if (nextPos == -1) nextPos = pos + 1
+                break
+            }
+
+            if ((len and 0xC0) == 0xC0) {
+                // Compression pointer
+                if (pos + 1 >= bytes.size) return null
+                if (hops >= MAX_DNS_COMPRESSION_HOPS) {
+                    Log.w(TAG, "DNS compression pointer loop or hop limit exceeded ($hops)")
+                    return null
+                }
+                hops++
+                val ptr = ((len and 0x3F) shl 8) or (bytes[pos + 1].toInt() and 0xFF)
+                if (ptr >= bytes.size || ptr == pos) {
+                    Log.w(TAG, "Malformed DNS compression pointer to offset $ptr (buf len ${bytes.size})")
+                    return null
+                }
+                if (nextPos == -1) nextPos = pos + 2
+                pos = ptr
+                continue
+            }
+
+            // Standard label
+            pos++
+            if (pos + len > bytes.size) return null
+            if (sb.isNotEmpty()) sb.append('.')
+            for (i in 0 until len) {
+                sb.append(bytes[pos + i].toInt().toChar())
+            }
+            pos += len
+        }
+
+        if (nextPos == -1) nextPos = pos
+        return Pair(sb.toString(), nextPos)
     }
 
     /**
@@ -108,29 +192,17 @@ object FakeDns {
             val qdCount = ((queryBytes[4].toInt() and 0xFF) shl 8) or (queryBytes[5].toInt() and 0xFF)
             if (qdCount < 1) return null
 
-            // Parse question domain name
-            var pos = 12
-            val domainBuilder = StringBuilder()
-            while (pos < queryBytes.size) {
-                val len = queryBytes[pos].toInt() and 0xFF
-                pos++
-                if (len == 0) break
-                if (pos + len > queryBytes.size) return null
-                if (domainBuilder.isNotEmpty()) domainBuilder.append('.')
-                for (i in 0 until len) {
-                    domainBuilder.append(queryBytes[pos + i].toInt().toChar())
-                }
-                pos += len
-            }
+            // Parse question domain name with compression pointer support
+            val parsed = parseDomainName(queryBytes, 12) ?: return null
+            val domain = parsed.first.lowercase()
+            var pos = parsed.second
 
             if (pos + 4 > queryBytes.size) return null
             val qType = ((queryBytes[pos].toInt() and 0xFF) shl 8) or (queryBytes[pos + 1].toInt() and 0xFF)
             val qClass = ((queryBytes[pos + 2].toInt() and 0xFF) shl 8) or (queryBytes[pos + 3].toInt() and 0xFF)
             pos += 4
 
-            val domain = domainBuilder.toString().lowercase()
             if (domain.isBlank()) return null
-
             if (qClass != 1) return null
 
             // Type 28 = AAAA (IPv6), Type 65 = HTTPS (RFC 9460)

@@ -14,8 +14,14 @@
 -dontwarn javax.annotation.Nonnull
 -dontwarn javax.annotation.meta.TypeQualifierDefault
 -dontwarn javax.lang.model.element.Modifier
+-dontwarn javax.naming.**
 -dontwarn org.slf4j.impl.StaticLoggerBinder
 -dontwarn org.slf4j.impl.StaticMDCBinder
 -dontwarn org.slf4j.impl.StaticMarkerBinder
 -keep class org.amnezia.awg.** { *; }
 -keep class com.wireguard.** { *; }
+
+# BouncyCastle
+-dontwarn org.bouncycastle.jce.provider.**
+-keep class org.bouncycastle.crypto.** { *; }
+-keep class org.bouncycastle.math.ec.rfc7748.** { *; }

@@ -24,7 +24,7 @@ object DoHBridgeFetcher {
     private val DOH_PROVIDERS = listOf(
         "https://cloudflare-dns.com/dns-query?name=%s&type=TXT",
         "https://dns.google/resolve?name=%s&type=TXT",
-        "https://dns.quad9.net:5053/dns-query?name=%s&type=TXT"
+        "https://dns.quad9.net/dns-query?name=%s&type=TXT"
     )
 
     private const val DEFAULT_FALLBACK_DOMAIN = "bridges.deltator.net"
@@ -32,12 +32,18 @@ object DoHBridgeFetcher {
     suspend fun fetchBridgesViaDoH(
         domain: String = DEFAULT_FALLBACK_DOMAIN
     ): List<String> = withContext(Dispatchers.IO) {
+        val encodedDomain = try {
+            java.net.URLEncoder.encode(domain, "UTF-8")
+        } catch (_: Exception) {
+            domain
+        }
         for (providerTemplate in DOH_PROVIDERS) {
-            val endpoint = String.format(providerTemplate, domain)
+            val endpoint = String.format(providerTemplate, encodedDomain)
+            var conn: HttpURLConnection? = null
             try {
                 Log.i(TAG, "Querying DoH TXT records from $endpoint")
                 val url = URL(endpoint)
-                val conn = url.openConnection() as HttpURLConnection
+                conn = url.openConnection() as HttpURLConnection
                 conn.connectTimeout = TIMEOUT_MS
                 conn.readTimeout = TIMEOUT_MS
                 conn.setRequestProperty("Accept", "application/dns-json")
@@ -55,6 +61,8 @@ object DoHBridgeFetcher {
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "DoH fetch failed for $endpoint: ${e.message}")
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
         emptyList()
@@ -81,9 +89,10 @@ object DoHBridgeFetcher {
                 } catch (_: Exception) {
                     data
                 }
-                decoded.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }.forEach {
-                    collected.add(it)
-                }
+                decoded.lines()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("#") && BridgeLineValidator.isValidBridgeLine(it) }
+                    .forEach { collected.add(it) }
             }
         }
         return collected

@@ -124,7 +124,7 @@ object Config {
      * tunnel is authenticated by the PPP layer either way.
      */
     var chainVerifyTlsCert: Boolean
-        get() = prefs.getBoolean("chain_verify_tls_cert", false)
+        get() = prefs.getBoolean("chain_verify_tls_cert", true)
         set(value) = prefs.edit().putBoolean("chain_verify_tls_cert", value).apply()
 
     /** What the live chain is measured with once it exists. */

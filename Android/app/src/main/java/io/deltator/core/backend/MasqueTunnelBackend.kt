@@ -31,6 +31,11 @@ class MasqueTunnelBackend(
 
     override suspend fun start(tunFd: ParcelFileDescriptor): Boolean = withContext(Dispatchers.IO) {
         try {
+            val uri = try { java.net.URI.create(serverUri) } catch (_: Exception) { null }
+            if (uri == null || uri.scheme?.lowercase() != "https" || uri.host.isNullOrBlank()) {
+                Log.e(TAG, "Invalid MASQUE server URI '$serverUri': must be a valid https:// URI (fail-closed)")
+                return@withContext false
+            }
             Log.i(TAG, "Starting MASQUE H3 Tunnel via TorSocksBridge: endpoint=$serverUri")
             TorSocksBridge.upstreamMode = TorSocksBridge.UpstreamMode.MASQUE
             TorSocksBridge.masqueEndpoint = serverUri
@@ -54,6 +59,7 @@ class MasqueTunnelBackend(
             )
             if (res.isFailure) {
                 Log.e(TAG, "Failed to start HevSocks5Tunnel for MASQUE: ${res.exceptionOrNull()?.message}")
+                stop()
                 return@withContext false
             }
             running = true
@@ -61,6 +67,7 @@ class MasqueTunnelBackend(
             true
         } catch (e: Exception) {
             Log.e(TAG, "MASQUE start failed: ${e.message}", e)
+            stop()
             running = false
             false
         }

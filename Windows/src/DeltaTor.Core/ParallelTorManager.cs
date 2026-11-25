@@ -310,7 +310,7 @@ public static partial class ParallelTorManager
             try
             {
                 using var l = new TcpListener(IPAddress.Parse(host), port);
-                l.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                l.ExclusiveAddressUse = true;
                 l.Start();
                 l.Stop();
                 free = true;

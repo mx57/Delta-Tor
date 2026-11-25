@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Reflection;
 using System.Text.Json;
 using DeltaTor.Core.Util;
@@ -16,7 +17,7 @@ namespace DeltaTor.Core;
 public static class ReleaseChecker
 {
     private const string TAG = "ReleaseChecker";
-    private const string Repo = "Delta-Kronecker/Delta-Tor";
+    private const string Repo = "mx57/Delta-Tor";
     private const string ApiLatest = "https://api.github.com/repos/" + Repo + "/releases/latest";
     private const string GithubUrl = "https://github.com/" + Repo;
     private const int TimeoutMs = 8_000;
@@ -31,8 +32,11 @@ public static class ReleaseChecker
     {
         try
         {
-            Process.Start(new ProcessStartInfo(
-                string.IsNullOrWhiteSpace(url) ? GithubUrl : url) { UseShellExecute = true });
+            var targetUrl = (string.IsNullOrWhiteSpace(url) || !url.StartsWith($"https://github.com/{Repo}", StringComparison.OrdinalIgnoreCase))
+                ? GithubUrl
+                : url;
+
+            Process.Start(new ProcessStartInfo(targetUrl) { UseShellExecute = true });
         }
         catch (Exception e)
         {
@@ -40,11 +44,21 @@ public static class ReleaseChecker
         }
     }
 
-    public static bool Check()
+    public static bool Check() => Check(null);
+
+    public static bool Check(string? socksProxy)
+    {
+        return CheckAsync(socksProxy).GetAwaiter().GetResult();
+    }
+
+    public static Task<bool> CheckAsync() => CheckAsync(null);
+
+    public static async Task<bool> CheckAsync(string? socksProxy)
     {
         try
         {
-            using var resp = Http.GetAsync(ApiLatest).GetAwaiter().GetResult();
+            using var client = CreateClient(socksProxy);
+            using var resp = await client.GetAsync(ApiLatest).ConfigureAwait(false);
             if ((int)resp.StatusCode != 200)
             {
                 AppLog.W(TAG, $"Update check HTTP {(int)resp.StatusCode}");
@@ -52,7 +66,7 @@ public static class ReleaseChecker
                 return false;
             }
 
-            var body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
             string tag;
             string htmlUrl;
             using (var doc = JsonDocument.Parse(body))
@@ -62,7 +76,10 @@ public static class ReleaseChecker
             }
             tag = tag.Trim();
             if (tag.StartsWith("v", StringComparison.Ordinal)) tag = tag[1..];
-            if (string.IsNullOrWhiteSpace(htmlUrl)) htmlUrl = $"{GithubUrl}/releases/tag/{tag}";
+            if (string.IsNullOrWhiteSpace(htmlUrl) || !htmlUrl.StartsWith($"https://github.com/{Repo}/releases/", StringComparison.OrdinalIgnoreCase))
+            {
+                htmlUrl = $"{GithubUrl}/releases/tag/{tag}";
+            }
 
             var current = CurrentVersion();
             var newer = tag.Length > 0 && CompareVersions(current, tag) < 0;
@@ -111,7 +128,7 @@ public static class ReleaseChecker
     /// non-numeric segments are dropped, missing segments count as 0.
     /// Returns negative when a is older than b.
     /// </summary>
-    private static int CompareVersions(string a, string b)
+    public static int CompareVersions(string a, string b)
     {
         var pa = IntParts(a);
         var pb = IntParts(b);
@@ -133,11 +150,20 @@ public static class ReleaseChecker
         return parts;
     }
 
-    private static readonly HttpClient Http = CreateClient();
-
-    private static HttpClient CreateClient()
+    private static HttpClient CreateClient(string? socksProxy = null)
     {
-        var c = new HttpClient { Timeout = TimeSpan.FromMilliseconds(TimeoutMs) };
+        var handler = new SocketsHttpHandler();
+        var proxyAddr = socksProxy;
+        if (string.IsNullOrEmpty(proxyAddr) && AppState.State.TorRunning)
+        {
+            proxyAddr = $"socks5://127.0.0.1:{Config.ProxyPort}";
+        }
+        if (!string.IsNullOrEmpty(proxyAddr))
+        {
+            handler.Proxy = new WebProxy(proxyAddr);
+            handler.UseProxy = true;
+        }
+        var c = new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(TimeoutMs) };
         c.DefaultRequestHeaders.UserAgent.ParseAdd("DeltaTor-Windows");
         return c;
     }

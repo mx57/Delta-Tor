@@ -5,7 +5,6 @@ import io.deltator.Config
 import io.deltator.util.AppLog as Log
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -511,7 +510,9 @@ object ParallelTorManager {
                 snapshot.values.forEach { r ->
                     if (r.failed == null && r.started && !r.isReady() && !r.isRunning()) {
                         val reason = r.failureSummary()
-                        r.failed = reason
+                        synchronized(runnersLock) {
+                            r.failed = reason
+                        }
                         Log.w(TAG, "${r.name} exited early: $reason")
                         Log.transport(sessionId, r.name, 'E', TAG, "tor died: $reason")
                     }
@@ -765,10 +766,17 @@ object ParallelTorManager {
      * Empty the map for a fresh start and take the generation that start owns.
      * Any poll loop still running on an older generation is watching runners
      * that no longer exist and is told so instead of failing on its own.
+     * Stops any previously lingering runners.
      */
-    private fun beginRunners(): Long = synchronized(runnersLock) {
-        runners = mutableMapOf()
-        generation.incrementAndGet()
+    private fun beginRunners(): Long {
+        val (oldRunners, gen) = synchronized(runnersLock) {
+            val old = runners.values.toList()
+            runners = mutableMapOf()
+            val nextGen = generation.incrementAndGet()
+            Pair(old, nextGen)
+        }
+        oldRunners.forEach { it.stop() }
+        return gen
     }
 
     private fun checkGeneration(gen: Long) {
@@ -838,10 +846,10 @@ object ParallelTorManager {
      * disk cache -> bundled assets -> network. A transport may be backed by
      * several files, which are merged by [mergeBridgeLists] into one list.
      */
-    private fun fetchBridgeLines(context: Context, only: Set<String>? = null): Map<String, String> {
+    private suspend fun fetchBridgeLines(context: Context, only: Set<String>? = null): Map<String, String> {
         val lines = LinkedHashMap<String, String>()
-        BRIDGE_SOURCES.forEach { (name, urls) ->
-            if (only != null && name !in only) return@forEach
+        for ((name, urls) in BRIDGE_SOURCES) {
+            if (only != null && name !in only) continue
             val cached = BridgeStore.lines(context, name)
             val content = when {
                 !cached.isNullOrBlank() -> cached
@@ -873,7 +881,7 @@ object ParallelTorManager {
         null
     }
 
-    private fun downloadLists(urls: List<String>): String {
+    private suspend fun downloadLists(urls: List<String>): String {
         val bodies = urls.mapNotNull { url ->
             val text = runCatching { downloadText(url) }.getOrElse {
                 Log.e(TAG, "download failed for $url: ${it.message}")
@@ -886,7 +894,7 @@ object ParallelTorManager {
 
         // Out-of-band fallback via DoH TXT records (Proposal #18)
         Log.i(TAG, "Direct downloads failed/empty; trying out-of-band DoH bridge discovery...")
-        val dohBridges = runBlocking(Dispatchers.IO) { DoHBridgeFetcher.fetchBridgesViaDoH() }
+        val dohBridges = DoHBridgeFetcher.fetchBridgesViaDoH()
         return if (dohBridges.isNotEmpty()) dohBridges.joinToString("\n") else ""
     }
 

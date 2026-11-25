@@ -69,14 +69,15 @@ object TorControl {
                 writeLine(writer, command.line)
                 val reply = readReply(reader)
                 val ok = reply.isNotEmpty() && reply.last().startsWith("250")
+                val safeCmd = if (command.line.startsWith("AUTHENTICATE", ignoreCase = true)) "AUTHENTICATE [REDACTED]" else command.line
                 if (!ok) {
                     if (command.optional) {
-                        Log.w(tag, "${command.line} -> ${reply.joinToString(" / ")} (ignored)")
+                        Log.w(tag, "$safeCmd -> ${reply.joinToString(" / ")} (ignored)")
                         continue
                     }
-                    throw RuntimeException("${command.line} -> ${reply.joinToString(" / ")}")
+                    throw RuntimeException("$safeCmd -> ${reply.joinToString(" / ")}")
                 }
-                Log.i(tag, "${command.line} -> ${reply.last()}")
+                Log.i(tag, "$safeCmd -> ${reply.last()}")
             }
             return true
         }
@@ -101,13 +102,6 @@ object TorControl {
         val methods = Regex("METHODS=([A-Z,]+)").find(methodsLine)
             ?.groupValues?.get(1)?.split(',')?.map { it.trim() } ?: emptyList()
         when {
-            methods.any { it.equals("NULL", ignoreCase = true) } -> {
-                writeLine(writer, "AUTHENTICATE")
-                val reply = readReply(reader)
-                if (!reply.lastOrNull().orEmpty().startsWith("250")) {
-                    throw RuntimeException("AUTHENTICATE(NULL) -> ${reply.joinToString(" / ")}")
-                }
-            }
             methods.any { it.equals("COOKIE", ignoreCase = true) } -> {
                 val hex = cookieHexOf(dataDir)
                     ?: error("no control_auth_cookie found in ${dataDir?.path}")
@@ -115,6 +109,13 @@ object TorControl {
                 val reply = readReply(reader)
                 if (!reply.lastOrNull().orEmpty().startsWith("250")) {
                     throw RuntimeException("AUTHENTICATE(COOKIE) -> ${reply.joinToString(" / ")}")
+                }
+            }
+            methods.any { it.equals("NULL", ignoreCase = true) } -> {
+                writeLine(writer, "AUTHENTICATE")
+                val reply = readReply(reader)
+                if (!reply.lastOrNull().orEmpty().startsWith("250")) {
+                    throw RuntimeException("AUTHENTICATE(NULL) -> ${reply.joinToString(" / ")}")
                 }
             }
             else -> {

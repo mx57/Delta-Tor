@@ -41,8 +41,8 @@ class AmneziaTunnelBackend(
     override suspend fun start(tunFd: ParcelFileDescriptor): Boolean = withContext(Dispatchers.IO) {
         try { tunFd.close() } catch (_: Exception) {}
         try {
-            if (config.endpoint.isBlank() || config.peerPublicKey.isBlank()) {
-                Log.w(TAG, "AmneziaWG config incomplete (endpoint/peer key missing)")
+            if (!config.validate()) {
+                Log.e(TAG, "AmneziaWG config invalid/incomplete: validation failed (endpoint/peer key missing or malformed)")
                 return@withContext false
             }
             Log.i(TAG, "Starting AmneziaWG (AWG): Jc=${config.jc} Jmin=${config.jmin} Jmax=${config.jmax} S1=${config.s1} S2=${config.s2} H1=${config.h1} H2=${config.h2} H3=${config.h3} H4=${config.h4}")
@@ -52,9 +52,13 @@ class AmneziaTunnelBackend(
             running = st == Tunnel.State.UP
             tunnelState = st
             Log.i(TAG, "AmneziaWG start state=$st endpoint=${config.endpoint}")
+            if (!running) {
+                stop()
+            }
             running
         } catch (e: Exception) {
             Log.e(TAG, "AmneziaWG start failed: ${e.message}", e)
+            stop()
             running = false; false
         }
     }
